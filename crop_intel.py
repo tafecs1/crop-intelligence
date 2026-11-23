@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """CropIntel – All-India tehsil crop intelligence → Google Sheet (8 tabs).
 
-GitHub Actions port of the Colab notebook Crop_Intelligence_FINAL v3.3. The crop / stage LOGIC IS UNCHANGED.
+GitHub Actions port of the Colab notebook Crop_Intelligence_FINAL v3.4. The crop / stage LOGIC IS UNCHANGED.
 Only the Colab-specific parts differ:
   * secrets come from environment variables (EE_KEY_JSON, CROP_SHEET_ID, EE_PROJECT, optional SHEETS_KEY_JSON);
   * files live in ./work (cache, downloads, Excel) and ./data (optional inputs you commit);
@@ -20,7 +20,8 @@ EE_SECRET_NAME = 'EE_KEY_JSON'
 SHEET_SECRET   = 'CROP_SHEET_ID'
 SHEET_ID       = os.environ.get('CROP_SHEET_ID', '')               # GitHub secret CROP_SHEET_ID (Sheet ID or link)
 EE_PROJECT     = os.environ.get('EE_PROJECT', '')                  # GitHub secret EE_PROJECT
-SHEETS_AUTH    = 'service_account'          # GitHub: service account only (share the Sheet with it as Editor)
+SHEETS_AUTH    = 'auto'                     # 'auto' = try the Sheets JSON key, then your own Google login (recommended)
+                                            # 'upload_key' | 'same_key' | 'google_login' to force one method
 
 # Tehsil boundaries: LGD sub-districts (direct download, no Earth Engine asset needed)
 BHARATLAS         = "https://bharatlas.com/api/v1"
@@ -44,15 +45,18 @@ TREND_STEPS     = 12                        # 14-day NDVI steps (12 = 168 days)
 MIN_VALID_SHARE = 0.10                      # min clear-cropland share for a monthly value to count
 GAP_FILL        = True                      # fill cloud gaps in index tabs from measured values (marked grey)
 # ---- Sentinel-1 paddy rule (v3.1). v3.0 used VH < -18 dB / +3 dB over a 5-month window → rice on 3.7 Mha (≈3× official) – see audit
-RICE_VH_FLOOD_DB = -20.0                    # flooded field: VH below this (dB)            – REFS['S1_RICE']
-RICE_VV_FLOOD_DB = -15.0                    # … AND VV below this on the same date (open water); dry soil rarely meets both
-RICE_VH_DROP_DB  = 3.0                      # field must DROP into the flood (max VH 5-45 d before ≥ flood VH + this) – excludes always-dark soil/tank beds
-RICE_VH_RISE_DB  = 5.0                      # canopy growth after flooding: max VH ≥ 14 d after flood ≥ flood VH + this
+RICE_VH_FLOOD_DB = float(os.environ.get('RICE_VH_FLOOD_DB') or -20.0)                    # flooded field: VH below this (dB)            – REFS['S1_RICE']
+RICE_VV_FLOOD_DB = float(os.environ.get('RICE_VV_FLOOD_DB') or -15.0)                    # … AND VV below this on the same date (open water); dry soil rarely meets both
+RICE_VH_DROP_DB  = float(os.environ.get('RICE_VH_DROP_DB') or 3.0)                      # field must DROP into the flood (max VH 5-45 d before ≥ flood VH + this) – excludes always-dark soil/tank beds
+RICE_VH_RISE_DB  = float(os.environ.get('RICE_VH_RISE_DB') or 5.0)                      # canopy growth after flooding: max VH ≥ 14 d after flood ≥ flood VH + this
 RICE_FLOOD_LEAD_DAYS = 120                  # transplanting searched from SEASON_START − this (≈ early June for Rabi) so late-kharif rice still standing in
                                             # Nov (Odisha, WB, AP …) is captured; TN samba still uses the LATEST flood episode
 RICE_RECENT_DAYS = 35                       # flooded within this many days and no rise yet → "recently puddled / transplanted" (Probable)
 RICE_HARVEST_NDVI = 0.30                    # rice pixel ≥ 80 d after transplanting whose max NDVI in the last 30 d is below this → harvested
-WC_MIN_SHARE     = 0.25                     # 2021 winter-cereal map share of tehsil cropland needed to report wheat/barley without Govt/SPAM data
+# v3.4: wheat/barley from the 2021 winter-cereal map is reported ONLY with Govt APY or SPAM corroboration (the old "≥25 % of
+#       cropland" rule reported delta thaladi rice as wheat in Thanjavur)
+RICE_CALIBRATE   = os.environ.get('RICE_CALIBRATE', 'false').lower() == 'true' or False                    # True = also compute paddy area under RICE_CAL_SETS (one extra comparison table, more EE compute)
+RICE_CAL_SETS    = [(-20.0, -15.0, 3.0, 5.0), (-19.0, -14.0, 2.0, 4.0), (-18.0, -13.0, 2.0, 3.0)]   # (VH flood, VV flood, drop, rise) dB
 GGCMI_DIR        = f'{DRIVE_DIR}/ggcmi'   # GGCMI Phase 3 crop calendar (auto-downloaded from Zenodo, CC BY 4.0)
 GGCMI_URL        = 'https://zenodo.org/records/5062513/files/{f}?download=1'
 GGCMI_WINDOW_DAYS = 30                      # ± days around the GGCMI (multi-year average) planting day accepted as the sowing window
@@ -64,7 +68,7 @@ REFERENCE_AREAS = [
          date='2026-11-14', source='newkerala.com, 14-Nov-2026 – also reports crops "planted about a month ago"'),
 ]
 FIELD_OBS_CSV    = f'{INPUT_DIR}/field_observations.csv'  # OPTIONAL ground truth: tehsil_lgd,crop,stage,observation_date,planting_date
-MODEL_VERSION   = 'CropIntel-v3.3'
+MODEL_VERSION   = 'CropIntel-v3.4'
 RUN_DATE        = os.environ.get('RUN_DATE') or None   # set once per workflow run so all jobs share the same date
 
 
@@ -94,7 +98,9 @@ if not EXTRACT_ONLY:
     SHEET_ID = _m.group(1) if _m else SHEET_ID.strip()
     assert SHEET_ID, 'Secret CROP_SHEET_ID is empty'
     _sk = json.loads(os.environ.get('SHEETS_KEY_JSON') or os.environ['EE_KEY_JSON'])
-    gc, SHEETS_USER = gspread.authorize(Credentials.from_service_account_info(_sk, scopes=SCOPES)), _sk['client_email']
+    from gspread.http_client import BackOffHTTPClient     # retries 'quota exceeded' (429) with exponential back-off
+    gc = gspread.authorize(Credentials.from_service_account_info(_sk, scopes=SCOPES), http_client=BackOffHTTPClient)
+    SHEETS_USER = _sk['client_email']
     _ok, _info = can_edit(gc, SHEET_ID)
     if not _ok:
         raise SystemExit(f'⛔ {SHEETS_USER} cannot edit the Sheet ({_info}). Open the Sheet → Share → add this e-mail as Editor.')
@@ -296,6 +302,7 @@ ASSUMPTION_GREENUP_LAG = (7, 25)   # days between planting and satellite-detecta
 ASSUMPTION_RICE_LONG_MAX = 160     # TNAU gives ">145/>150 d" for long-duration rice without an upper bound.
 ASSUMPTION_RICE_ESTAB = 10         # days of post-transplanting establishment (recovery) before active tillering – disclosed assumption.
 ASSUMPTION_PUDDLE_TO_TRANSPLANT = (0, 7)   # days from the start of puddling flood (seen by S1) to transplanting – disclosed assumption.
+ASSUMPTION_RICE_GREENUP_LAG = (10, 35)     # days from transplanting to a sustained optical green-up of paddy pixels – disclosed assumption.
 
 STAGE_BUCKETS = ['Land Prep', 'Sowing', 'Germination', 'Vegetative', 'Flowering', 'Grain Fill/Maturity', 'Harvest']
 PHASES = {'pre': 'bare / pre-green-up', 'rising': 'green-up / canopy development', 'peak': 'canopy peak',
@@ -482,7 +489,7 @@ def s1_collection(start, end, region, pols=('VV', 'VH')):
         col = col.filter(ee.Filter.listContains('transmitterReceiverPolarisation', p))
     return col.select(list(pols))
 
-def rice_layers(region):
+def rice_layers(region, vh_th=None, vv_th=None, drop_db=None, rise_db=None, core_only=False):
     """v3.1 paddy rule, per pixel, Sentinel-1 VV+VH, CURRENT SEASON ONLY:
     1) flooded acquisition = VH < RICE_VH_FLOOD_DB AND VV < RICE_VV_FLOOD_DB, on/after RICE_FLOOD_START;
     2) planting = START of the LATEST flooding episode (first flooded acquisition after the last non-flooded one). Standing water
@@ -491,6 +498,10 @@ def rice_layers(region):
     4) established rice = max VH ≥ 14 d after the flood ≥ flood VH + RICE_VH_RISE_DB (canopy growth);
        recent = flooded within RICE_RECENT_DAYS, drop passed, rise not yet seen (puddled / just transplanted → Probable only).
     Permanent water (JRC occurrence > 50 %) and non-cropland (WorldCover) excluded."""
+    vh_th = RICE_VH_FLOOD_DB if vh_th is None else vh_th
+    vv_th = RICE_VV_FLOOD_DB if vv_th is None else vv_th
+    drop_db = RICE_VH_DROP_DB if drop_db is None else drop_db
+    rise_db = RICE_VH_RISE_DB if rise_db is None else rise_db
     t0 = ee.Date(str(S1_START))
     fs, fe = (RICE_FLOOD_START - S1_START).days, (TODAY - S1_START).days
     def prep(i):
@@ -499,18 +510,20 @@ def rice_layers(region):
     empty = ee.Image.constant([0, 0, 0]).rename(['VV', 'VH', 't']).toFloat().updateMask(ee.Image.constant(0))
     col = s1_collection(S1_START, TODAY + dt.timedelta(days=1), region, ('VV', 'VH')).map(prep).merge(ee.ImageCollection([empty]))
     def flooded(i):
-        return i.updateMask(i.select('VH').lt(RICE_VH_FLOOD_DB).And(i.select('VV').lt(RICE_VV_FLOOD_DB)).And(i.select('t').gte(fs)))
+        return i.updateMask(i.select('VH').lt(vh_th).And(i.select('VV').lt(vv_th)).And(i.select('t').gte(fs)))
     fl = col.map(flooded)
     t_last = fl.select('t').max()
-    t_dry = (col.map(lambda i: i.updateMask(i.select('VH').gte(RICE_VH_FLOOD_DB).Or(i.select('VV').gte(RICE_VV_FLOOD_DB))
+    t_dry = (col.map(lambda i: i.updateMask(i.select('VH').gte(vh_th).Or(i.select('VV').gte(vv_th))
                                        .And(i.select('t').lt(t_last)))).select('t').max().unmask(-1))
     ep = fl.map(lambda i: i.updateMask(i.select('t').gt(t_dry)))
     ft, fvh = ep.select('t').min(), ep.select('VH').min()
     prior_max = col.map(lambda i: i.updateMask(i.select('t').lt(ft.subtract(5)).And(i.select('t').gte(ft.subtract(45))))).select('VH').max()
     rise = col.map(lambda i: i.updateMask(i.select('t').gte(ft.add(14)))).select('VH').max().subtract(fvh)
-    base = prior_max.subtract(fvh).gte(RICE_VH_DROP_DB).And(CROPLAND).And(WATER.Not())
-    est_all = base.And(rise.gte(RICE_VH_RISE_DB)).unmask(0)
-    recent = base.And(ft.gte(fe - RICE_RECENT_DAYS)).And(rise.lt(RICE_VH_RISE_DB).unmask(1)).unmask(0).And(est_all.Not())
+    base = prior_max.subtract(fvh).gte(drop_db).And(CROPLAND).And(WATER.Not())
+    est_all = base.And(rise.gte(rise_db)).unmask(0)
+    if core_only:                                            # calibration: paddy this season (standing + harvested) + recently flooded
+        return est_all.Or(base.And(ft.gte(fe - RICE_RECENT_DAYS)).unmask(0))
+    recent = base.And(ft.gte(fe - RICE_RECENT_DAYS)).And(rise.lt(rise_db).unmask(1)).unmask(0).And(est_all.Not())
     # harvested this season: paddy cycle ≥ 80 d old AND max NDVI in the last 30 d below RICE_HARVEST_NDVI (cloud-masked → treated as standing)
     nd30 = (s2_collection(TODAY - dt.timedelta(days=30), TODAY + dt.timedelta(days=1), region)
             .map(lambda i: i.normalizedDifference(['B8', 'B4']).rename('NDVI')).max())
@@ -579,6 +592,8 @@ def maps_image(region):
     dw_mode = dwc.mode()
     dw_crop = dw_mode.eq(4).Or(dw_mode.eq(3))               # 4 = crops, 3 = flooded vegetation
     cohorts = [b.toFloat().rename(f'rice_coh_{k:02d}') for k, b in enumerate(R['bins'])]
+    if RICE_CALIBRATE:
+        cohorts += [rice_layers(region, *cs, core_only=True).toFloat().rename(f'rice_cal_{k}') for k, cs in enumerate(RICE_CAL_SETS)]
     return ee.Image.cat([
         rice.toFloat().rename('rice_frac'), recent.toFloat().rename('rice_recent_frac'), R['v30'].toFloat().rename('rice_frac_v30'),
         R['harv'].toFloat().rename('rice_harv_frac'), R['ft_harv'].rename('rice_harv_t'),
@@ -839,6 +854,8 @@ def safe_reduce(kind, codes, img_fn, add_area=False, scale=None):
     return res
 
 SAT_MONTHLY, SAT_TREND, SAT_CUR, SAT_MAPS, SAT_WX = {}, {}, {}, {}, {}
+RICE_SIG = hashlib.md5(json.dumps([RICE_VH_FLOOD_DB, RICE_VV_FLOOD_DB, RICE_VH_DROP_DB, RICE_VH_RISE_DB, RICE_FLOOD_LEAD_DAYS,
+                                   RICE_RECENT_DAYS, RICE_HARVEST_NDVI, RICE_CALIBRATE, RICE_CAL_SETS]).encode()).hexdigest()[:8]
 GEO_AREA_HA = dict(zip(TEH.lgd, (gpd.GeoSeries(TEH.geometry, crs=4326).to_crs(6933).area / 1e4).round(1)))  # full-res, equal-area
 # GitHub: batches are built per state, so a shard job and the final job create identical batches (= identical cache files)
 SHARD_COUNT, SHARD_INDEX = int(os.environ.get('SHARD_COUNT', '1')), int(os.environ.get('SHARD_INDEX', '0'))
@@ -858,11 +875,11 @@ for bi, codes in enumerate(_batches, 1):
         kind = f"M_{mg[0]:%Y%m}_{mg[-1]:%Y%m}" + (f'_{TODAY}' if CUR_MONTH in mg else '')
         for pr in safe_reduce(kind, codes, monthly_image_fn(mg)):
             SAT_MONTHLY.setdefault(norm_code(pr.get(LGD_F)), {}).update(pr)
-    for pr in safe_reduce(f'TREND4_{TODAY}', codes, trend_image):
+    for pr in safe_reduce(f'TREND5_{TODAY}_{RICE_SIG}', codes, trend_image):
         SAT_TREND[norm_code(pr.get(LGD_F))] = pr
     for pr in safe_reduce(f'CUR4_{TODAY}', codes, current_image, add_area=True):
         SAT_CUR[norm_code(pr.get(LGD_F))] = pr
-    for pr in safe_reduce(f'MAPS4_{TODAY}', codes, maps_image):
+    for pr in safe_reduce(f'MAPS5_{TODAY}_{RICE_SIG}', codes, maps_image):
         SAT_MAPS[norm_code(pr.get(LGD_F))] = pr
     for pr in safe_reduce(f'WX_{TODAY}', codes, weather_image, scale=11132):
         SAT_WX[norm_code(pr.get(LGD_F))] = pr
@@ -947,8 +964,8 @@ def spam_cells():
         _download(pick[0], path)
     except requests.HTTPError as e:
         raise RuntimeError('Harvard Dataverse needs a guestbook form for this file. Download '
-                           f'"{pick[1]}" once in your browser from https://doi.org/10.7910/DVN/SWPENT and put it in '
-                           'Google Drive → MyDrive/crop_intel/ , then re-run this cell.') from e
+                           f'"{pick[1]}" once in your browser from https://doi.org/10.7910/DVN/SWPENT and commit it to the repo '
+                           'folder data/ (only if under 100 MB), then re-run.') from e
     if path.endswith('.zip'):
         zipfile.ZipFile(path).extractall(f'{WORK_DIR}/spam')
     return _spam_parse(cache)
@@ -1018,8 +1035,17 @@ try:
         for sysn in ('ir', 'rf'):
             fn = f'{code}_{sysn}_ggcmi_crop_calendar_phase3_v1.01.nc4'
             pth = f'{GGCMI_DIR}/{fn}'
+            if not os.path.exists(pth) and os.path.exists(f'{INPUT_DIR}/ggcmi/{fn}'):
+                pth = f'{INPUT_DIR}/ggcmi/{fn}'                       # files committed to the repo (data/ggcmi/)
             if not os.path.exists(pth):
-                rq = requests.get(GGCMI_URL.format(f=fn), timeout=180, headers={'User-Agent': 'Mozilla/5.0'})
+                for url in (f'https://zenodo.org/api/records/5062513/files/{fn}/content', GGCMI_URL.format(f=fn)):
+                    for attempt in range(3):
+                        rq = requests.get(url, timeout=180, headers={'User-Agent': 'CropIntel/3.3 (+https://github.com/tafecs1/crop-intelligence)'})
+                        if rq.status_code == 200:
+                            break
+                        time.sleep(5 * (attempt + 1))
+                    if rq.status_code == 200:
+                        break
                 rq.raise_for_status()
                 open(pth, 'wb').write(rq.content)
             with xr.open_dataset(pth) as dsx:
@@ -1154,7 +1180,8 @@ def crossings(dates, vals, ref_amp=None, min_amp=0.12):
     peaked = pk < len(vs) - 1 and rise >= 0.8 * ref and vs[-1] < vs[pk] - min_amp / 6
     out = {'peak': pts[pk][0] if peaked else None, 'amp': ref, 'min': mn, 'peaked': peaked}
     for key, f in (('c10', .1), ('c30', .3), ('c80r', .8)):
-        out[key] = next((pts[i][0] for i in range(start + 1, pk + 1) if vs[i] >= mn + f * ref), None)
+        # v3.4: a crossing counts only if the curve then STAYS above the level up to the peak (noise blips in a flat baseline ignored)
+        out[key] = next((pts[i][0] for i in range(start + 1, pk + 1) if all(v >= mn + f * ref for v in vs[i:pk + 1])), None)
     for key, f in (('c80f', .8), ('c20f', .2)):
         out[key] = next((pts[i][0] for i in range(pk + 1, len(pts)) if vs[i] <= mn + f * ref), None) if peaked else None
     return out
@@ -1397,8 +1424,7 @@ def crops_v3(r, geo_ha, cl_ha, mp, cur_share):
     wc_share = (f('wc_frac') or 0) * geo_ha / cl_ha if cl_ha else 0
     wc_spam = (SPAM_TEH.get(r.lgd) or {}).get('whea', 0) + (SPAM_TEH.get(r.lgd) or {}).get('barl', 0)
     wc_why = ('Govt APY reports wheat/barley in the district' if wc_govt > 0 else
-              f'SPAM 2020 shows {wc_spam:,.0f} ha wheat/barley' if wc_spam > 0 else
-              f'2021 winter-cereal map covers {wc_share:.0%} of tehsil cropland (≥ {WC_MIN_SHARE:.0%} rule)' if wc_share >= WC_MIN_SHARE else None)
+              f'SPAM 2020 shows {wc_spam:,.0f} ha wheat/barley' if wc_spam > 0 else None)
     if wc_ha >= 1 and wc_why and SEASON == 'Rabi':
         out.append(dict(crop='Wheat (winter cereal – wheat/barley not separable by map)', group='Cereals', model='Wheat', trend='WC', area=wc_ha,
             src='Historical map (2021) + current activity', presence='Probable crop identification',
@@ -1553,24 +1579,43 @@ for r in TEH.itertuples():
             rf = fnum(mp.get('rice_frac')) or 0
             coh = [(k, (fnum(mp.get(f'rice_coh_{k:02d}')) or 0) / rf if rf else 0) for k in range(len(RICE_BINS))]
             coh = [(k, sh_) for k, sh_ in coh if sh_ > 0]
+            G = ph['cx'].get('c10') if (ph and ph.get('cx')) else None      # sustained optical green-up of the paddy pixels
+            bin_a = lambda k: S1_START + dt.timedelta(days=RICE_BINS[k][0])
+            bin_b = lambda k: S1_START + dt.timedelta(days=RICE_BINS[k][1] - 1)
             if coh:
-                cohort_txt = 'Transplanting cohorts (share of paddy pixels): ' + ', '.join(
-                    f'{S1_START + dt.timedelta(days=RICE_BINS[k][0]):%d-%b}–{S1_START + dt.timedelta(days=RICE_BINS[k][1] - 1):%d-%b} {sh_:.0%}'
-                    for k, sh_ in coh if sh_ >= 0.05)
-                k1, sh1 = max(coh, key=lambda x: x[1])
-                k2 = max((x for x in coh if abs(x[0] - k1) == 1), key=lambda x: x[1], default=(k1, 0))
-                ks = sorted({k1, k2[0]}) if sh1 < 0.5 and sh1 + k2[1] >= 0.5 else [k1]
-                main_share = sum(sh_ for k, sh_ in coh if k in ks)
+                cohort_txt = 'Flooding-episode cohorts (share of paddy pixels): ' + ', '.join(
+                    f'{bin_a(k):%d-%b}–{bin_b(k):%d-%b} {sh_:.0%}' for k, sh_ in coh if sh_ >= 0.05)
+            # v3.4 fix 1: a radar flooding date is accepted only if the optical green-up follows it within 0-45 d
+            bin_m = lambda k: bin_a(k) + (bin_b(k) - bin_a(k)) / 2
+            # green-up is read from 14-day composites, so it can appear up to ~14 d before the true transplanting date
+            use = [(k, sh_) for k, sh_ in coh if -14 <= (G - bin_m(k)).days <= 45] if G else coh
+            tot = sum(sh_ for _, sh_ in use)
+            if G and coh and tot < sum(sh_ for _, sh_ in coh):
+                unc_notes.append(f'{1 - tot / sum(sh_ for _, sh_ in coh):.0%} of paddy pixels have flood episodes > 45 d before the optical '
+                                 f'green-up ({G:%d-%b}) – fields kept flooded before transplanting or an earlier crop; those dates ignored')
+            if use and tot >= 0.3 * sum(sh_ for _, sh_ in coh):
+                k1, sh1 = max(use, key=lambda x: x[1])
+                k2 = max((x for x in use if abs(x[0] - k1) == 1), key=lambda x: x[1], default=(k1, 0))
+                ks = sorted({k1, k2[0]}) if sh1 / tot < 0.5 and (sh1 + k2[1]) / tot >= 0.5 else [k1]
+                main_share = sum(sh_ for k, sh_ in use if k in ks) / tot
                 if main_share >= 0.5:
-                    a = S1_START + dt.timedelta(days=RICE_BINS[ks[0]][0]); b = S1_START + dt.timedelta(days=RICE_BINS[ks[-1]][1] - 1)
+                    a, b = bin_a(ks[0]), bin_b(ks[-1])
                     e1, e2 = a - dt.timedelta(days=6), b + dt.timedelta(days=ASSUMPTION_PUDDLE_TO_TRANSPLANT[1])
                     S = a + (b - a) / 2
-                    s_method = (f'Sentinel-1: start of the latest flooding episode (puddling) of the main transplanting cohort '
-                                f'({main_share:.0%} of paddy pixels); transplanting 0-{ASSUMPTION_PUDDLE_TO_TRANSPLANT[1]} d later (ASSUMPTION); '
-                                f'±6 d S1 revisit')
+                    s_method = (f'Sentinel-1: start of the latest flooding episode (puddling) of the main cohort ({main_share:.0%} of '
+                                f'paddy pixels whose flooding is followed by optical green-up within 45 d); transplanting 0-'
+                                f'{ASSUMPTION_PUDDLE_TO_TRANSPLANT[1]} d later (ASSUMPTION); ±6 d S1 revisit')
                     s_w = 0.8 if main_share >= 0.7 else 0.6
-                else:
-                    unc_notes.append('transplanting dates spread over several cohorts (no cohort ≥ 50 %) – one stage cannot represent the tehsil')
+            if S is None and G:
+                e1, e2 = G - dt.timedelta(days=ASSUMPTION_RICE_GREENUP_LAG[1]), G - dt.timedelta(days=ASSUMPTION_RICE_GREENUP_LAG[0])
+                S = e1 + (e2 - e1) / 2
+                s_method = (f'Optical green-up of the radar-confirmed paddy pixels ({G:%d-%b}) minus transplanting-to-green-up lag '
+                            f'{ASSUMPTION_RICE_GREENUP_LAG[0]}-{ASSUMPTION_RICE_GREENUP_LAG[1]} d (ASSUMPTION); radar flooding dates were '
+                            'spread or earlier than the crop cycle')
+                s_w = 0.5
+            if S is None and coh:
+                unc_notes.append('transplanting dates spread over several cohorts and no sustained optical green-up – one stage cannot '
+                                 'represent the tehsil')
         elif model == 'RICE_HARVESTED' and fnum(mp.get('rice_harv_t')) is not None:
             S = S1_START + dt.timedelta(days=int(fnum(mp['rice_harv_t'])))
             e1, e2 = S - dt.timedelta(days=6), S + dt.timedelta(days=ASSUMPTION_PUDDLE_TO_TRANSPLANT[1])
@@ -1598,9 +1643,9 @@ for r in TEH.itertuples():
         sow_conf = round(100 * s_w * (1 - min(1, (unc_days or 0) / 90))) if S else ''
         # rice: transplanting must precede optical green-up by 0-45 d, else the radar date is not trusted for staging
         greenup = ph['cx'].get('c10') if (ph and ph.get('cx')) else None
-        rice_conflict = bool(model == 'RICE' and S and greenup and not (-7 <= (greenup - S).days <= 45))
+        rice_conflict = bool(model == 'RICE' and S and greenup and not (-14 <= (greenup - S).days <= 45))
         if rice_conflict:
-            unc_notes.append(f'S1 transplanting ~{S:%d-%b} vs S2 green-up {greenup:%d-%b}: {(greenup - S).days:+d} d (expected 0 to +45) – '
+            unc_notes.append(f'S1 transplanting ~{S:%d-%b} vs S2 green-up {greenup:%d-%b}: {(greenup - S).days:+d} d (expected -14 to +45) – '
                              'dates inconsistent, stage not assigned')
 
         # ---- presence label (current-season evidence only; an old map never gives "High-confidence")
@@ -2074,7 +2119,9 @@ for ref in REFERENCE_AREAS:
     REF_ROWS.append({'Scope': ref['scope'], 'Reference': ref['what'], 'Reference ha': ref['ha'], 'As of': ref['date'],
                      'Source': ref['source'], 'v3.0 rule ha (same run)': round(old), 'Current-rule estimate ha': round(est),
                      'Estimate / reference': round(ratio, 2) if ratio else '', 'Verdict': verdict,
-                     'Note': 'Partial coverage if the run is filtered to some states/districts' if STATE_FILTER else ''})
+                     'Note': 'Partial coverage if the run is filtered to some states/districts' if STATE_FILTER else '',
+                     **({f'Calibration {cs} ha': round(sum((fnum(SAT_MAPS.get(l, {}).get(f'rice_cal_{k}')) or 0) * GEO_AREA_HA.get(l, 0)
+                                                               for l in teh.lgd)) for k, cs in enumerate(RICE_CAL_SETS)} if RICE_CALIBRATE else {})})
 STAGE_KIND = Counter((x[7], 'single stage' if (x[23] != UNC and '(transition)' not in x[23]) else
                       'transition' if x[23] != UNC else 'not determined') for x in T1_ROWS)
 GATE = Counter(q.split(':')[0] for x in T1_ROWS for q in str(x[51]).split('; ') if 'stage rejected' in q)
@@ -2083,6 +2130,13 @@ print('📏 Reference checks:')
 for rr in REF_ROWS:
     print(f"   {rr['Scope']}: old v3.0 rule {rr['v3.0 rule ha (same run)']:,} ha → current rule {rr['Current-rule estimate ha']:,} ha vs {rr['Reference']} "
           f"{rr['Reference ha']:,} ha → {rr['Verdict']}")
+if RICE_CALIBRATE:
+    print('🎚️ Rice threshold calibration (VH flood, VV flood, drop, rise) → paddy ha this season (standing + harvested + recently flooded):')
+    for rr in REF_ROWS:
+        print(f"   {rr['Scope']} (reference {rr['Reference ha']:,} ha, {rr['Reference']}):")
+        for k, cs in enumerate(RICE_CAL_SETS):
+            v = rr[f'Calibration {cs} ha']
+            print(f"      {cs}: {v:,} ha  = {v / rr['Reference ha']:.0%} of reference")
 print('🚦 Publish gate rejections:', dict(GATE) or 'none')
 
 DATA_SOURCES = pd.DataFrame([

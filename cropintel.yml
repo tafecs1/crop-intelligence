@@ -1,0 +1,121 @@
+name: CropIntel weekly
+
+on:
+  schedule:
+    - cron: '30 20 * * 0'          # every Monday 02:00 IST (Sunday 20:30 UTC)
+  workflow_dispatch:
+    inputs:
+      state_filter:
+        description: 'States, comma-separated (empty = ALL INDIA), e.g. Tamil Nadu,Kerala'
+        required: false
+        default: ''
+      shards:
+        description: 'Parallel Earth Engine extraction jobs'
+        required: false
+        default: '6'
+      rice_calibrate:
+        description: 'Rice threshold calibration table (true/false) – use with a single state'
+        required: false
+        default: 'false'
+
+concurrency:
+  group: cropintel
+  cancel-in-progress: false
+
+env:
+  STATE_FILTER: ${{ github.event.inputs.state_filter || '' }}
+  RICE_CALIBRATE: ${{ github.event.inputs.rice_calibrate || 'false' }}
+  # chosen rice thresholds: Settings → Secrets and variables → Actions → Variables (empty = defaults in crop_intel.py)
+  RICE_VH_FLOOD_DB: ${{ vars.RICE_VH_FLOOD_DB }}
+  RICE_VV_FLOOD_DB: ${{ vars.RICE_VV_FLOOD_DB }}
+  RICE_VH_DROP_DB: ${{ vars.RICE_VH_DROP_DB }}
+  RICE_VH_RISE_DB: ${{ vars.RICE_VH_RISE_DB }}
+  PYTHONUNBUFFERED: '1'
+
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    outputs:
+      run_date: ${{ steps.p.outputs.run_date }}
+      shards: ${{ steps.p.outputs.shards }}
+      count: ${{ steps.p.outputs.count }}
+    steps:
+      - id: p
+        run: |
+          N="${{ github.event.inputs.shards || '6' }}"
+          echo "run_date=$(TZ=Asia/Kolkata date +%F)" >> "$GITHUB_OUTPUT"
+          echo "count=$N" >> "$GITHUB_OUTPUT"
+          echo "shards=$(python3 -c "import json;print(json.dumps(list(range($N))))")" >> "$GITHUB_OUTPUT"
+
+  extract:                           # Earth Engine extraction, split by state across parallel jobs
+    needs: setup
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJSON(needs.setup.outputs.shards) }}
+    env:
+      RUN_DATE: ${{ needs.setup.outputs.run_date }}
+      EXTRACT_ONLY: '1'
+      SHARD_INDEX: ${{ matrix.shard }}
+      SHARD_COUNT: ${{ needs.setup.outputs.count }}
+      EE_KEY_JSON: ${{ secrets.EE_KEY_JSON }}
+      EE_PROJECT: ${{ secrets.EE_PROJECT }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Restore Earth Engine cache (previous weeks – reuses unchanged past months)
+        uses: actions/cache@v4
+        with:
+          path: work/cache
+          key: ee-cache-${{ matrix.shard }}-${{ github.run_id }}
+          restore-keys: ee-cache-${{ matrix.shard }}-
+      - name: Drop cache files older than 20 days (keeps the cache small)
+        run: find work/cache -name '*.json' -mtime +20 -delete 2>/dev/null || true
+      - run: python crop_intel.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cache-shard-${{ matrix.shard }}
+          path: work/cache
+          retention-days: 3
+
+  build:                             # full pipeline from the cache → 8 tabs in the Google Sheet + Excel artifact
+    needs: [setup, extract]
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    env:
+      RUN_DATE: ${{ needs.setup.outputs.run_date }}
+      EE_KEY_JSON: ${{ secrets.EE_KEY_JSON }}
+      EE_PROJECT: ${{ secrets.EE_PROJECT }}
+      CROP_SHEET_ID: ${{ secrets.CROP_SHEET_ID }}
+      SHEETS_KEY_JSON: ${{ secrets.SHEETS_KEY_JSON }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - run: pip install -r requirements.txt
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: cache-shard-*
+          path: work/cache
+          merge-multiple: true
+      - name: Restore GGCMI calendar download
+        uses: actions/cache@v4
+        with:
+          path: work/ggcmi
+          key: ggcmi-phase3-v1.01
+      - run: python crop_intel.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: CropIntel-Excel-${{ needs.setup.outputs.run_date }}
+          path: work/Crop_Intelligence_*.xlsx
+          retention-days: 30
