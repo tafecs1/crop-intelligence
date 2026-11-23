@@ -13,6 +13,10 @@ on:
         description: 'Parallel Earth Engine extraction jobs'
         required: false
         default: '6'
+      rice_calibrate:
+        description: 'Rice threshold calibration table (true/false) – use with a single state'
+        required: false
+        default: 'false'
 
 concurrency:
   group: cropintel
@@ -20,6 +24,12 @@ concurrency:
 
 env:
   STATE_FILTER: ${{ github.event.inputs.state_filter || '' }}
+  RICE_CALIBRATE: ${{ github.event.inputs.rice_calibrate || 'false' }}
+  # chosen rice thresholds: Settings → Secrets and variables → Actions → Variables (empty = defaults in crop_intel.py)
+  RICE_VH_FLOOD_DB: ${{ vars.RICE_VH_FLOOD_DB }}
+  RICE_VV_FLOOD_DB: ${{ vars.RICE_VV_FLOOD_DB }}
+  RICE_VH_DROP_DB: ${{ vars.RICE_VH_DROP_DB }}
+  RICE_VH_RISE_DB: ${{ vars.RICE_VH_RISE_DB }}
   PYTHONUNBUFFERED: '1'
 
 jobs:
