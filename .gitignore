@@ -1,0 +1,5 @@
+work/
+__pycache__/
+*.json
+!data/*.json
+.env
