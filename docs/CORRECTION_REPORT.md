@@ -100,3 +100,39 @@ pytest -q tests
 #   state_filter = Tamil Nadu, rice_calibrate = true, shards = 6
 # outputs: Google Sheet (8 tabs) + artifact CropIntel-Excel-<date> (workbook, stage_report.md, crop_phenology_db.csv)
 ```
+
+## 7. v4.0.1 – fixes from the independent audit of RUN-20261124-073719
+
+The submitted `Crop_Intelligence (2).xlsx` was still the v3.5 output (identical content to the baseline), so it was audited as-is
+(`tools/audit_workbook.py`, report `Exception_Report_RUN-20261124-073719.xlsx`). Issues not yet covered by v4.0 and now fixed:
+
+| ID | Finding | Fix | Test |
+|---|---|---|---|
+| I-15 | 92 tehsils: crop rows sum to more than active cropland – newly transplanted paddy was left out of the subtraction, so the unidentified row counted it again | every satellite row subtracted once, unidentified floored at 0 | test_20, in-pipeline T8 |
+| I-16 | curve-picked stage far from the days-after-planting model (maize at 51 DAS reported "Silking – grain filling") | stage must be within ±1 stage of the duration-model stage at the point planting date, otherwise `Stage unresolved – satellite evidence contradicts…` | test_18 |
+| I-17 | expected harvest already in the past while the crop is still at pod / grain filling (36 rows) | harvest window moved to (start of observed stage + table time to harvest), QC19 | test_21, in-pipeline T17 |
+| I-18 | 766 duplicate (tehsil, crop) records – three paddy cohorts shared one crop name | `Rice (paddy)`, `Rice (paddy) – newly transplanted`, `Rice (paddy) – harvested this season` (dominant crop aggregates them) | test_19, in-pipeline T16 |
+
+Audit re-run on a v4.0.1 synthetic workbook: 0 exceptions. Run `python3 tools/audit_workbook.py <workbook.xlsx> crop_intel.py <report.xlsx>`
+on every regenerated workbook before releasing it.
+
+## 8. v4.1 – Ideal_Crop_Window rebuilt at DISTRICT level
+
+* **Why:** TNAU publishes crop calendars per district / agro-climatic zone. The tehsil-level Tab 8 repeated the same statewide windows for
+  every tehsil and mixed in calendar-only sowing dates, which made it look more precise than its sources.
+* **New source table:** `data/tn_district_crop_calendar.csv` (113 rows, 14 crops). Every row has its season (pattam), sowing months, districts,
+  duration, varieties, source URL and a confidence:
+  * **High:** copied from the TNAU Agritech "Seasons & Varieties" pages (rice, cotton, sugarcane, sorghum, ragi, cumbu, red gram,
+    Bengal gram, sesame, sunflower).
+  * **Medium:** extracted from the text of the TNAU Crop Production Guide PDF (black gram, green gram, groundnut, maize). The PDF table
+    layout was partly garbled.
+  * **Low:** rows whose alignment in the PDF text was ambiguous, each with its reason, plus the North-Western / Western maize zones,
+    where the statewide pattams are shown.
+* **Districts created after the source tables** (Chengalpattu, Tenkasi, Kallakurichi, Ranipet, Tirupathur, Mayiladuthurai) inherit
+  their parent district's row, flagged in QC. Krishnagiri and Tiruppur rice rows come from the TNAU zone table.
+* **Tab 8 rows:** one per district × crop × season (Tamil Nadu). States outside Tamil Nadu get GGCMI / national-window rows marked Low.
+* **Observed columns** (area, district median planting date, deviation, timing, current stage, expected harvest) come only from tehsils with
+  an OBSERVED planting date. Each observation is assigned to exactly one season row, so overlapping seasons never double count.
+  Observations outside every TNAU window are listed in QC_Summary.
+* **Dashboard:** join Tab 8 on **District LGD Code** (it no longer has Tehsil columns).
+* **Tests:** 23 tests pass, including calendar file integrity, district coverage, observation assignment and harvest = sowing + duration.

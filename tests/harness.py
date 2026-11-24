@@ -1,5 +1,5 @@
 """Synthetic, Earth-Engine-free harness: runs cells 2-12 (Excel part) of crop_intel.py on 10 made-up tehsils."""
-import re, sys, os, math, json, random, datetime as dt, collections, types
+import re, os, sys, os, math, json, random, datetime as dt, collections, types
 import pandas as pd, numpy as np
 def build(path, work='/tmp/cropintel_test'):
     src = open(path).read()
@@ -17,7 +17,7 @@ def build(path, work='/tmp/cropintel_test'):
     # 7b definitions only
     c7b = code['7b']; exec(c7b[:c7b.index('if USE_SPAM:')], ns)
     c7b2 = code['7b2']; exec(c7b2[:c7b2.index('if USE_CROPGRIDS and not SPAM_TEH:')], ns)
-    TEH = pd.DataFrame([dict(state='Tamil Nadu' if i<8 else 'Punjab', state_lgd=33 if i<8 else 3, district=f'D{i%3}' if i<8 else 'Ludhiana', district_lgd=600+i%3 if i<8 else 40, tehsil=f'T{i}', tehsil_lgd=5000+i) for i in range(10)])
+    TEH = pd.DataFrame([dict(state='Tamil Nadu' if i<8 else 'Punjab', state_lgd=33 if i<8 else 3, district=['Thanjavur','Madurai','Coimbatore'][i%3] if i<8 else 'Ludhiana', district_lgd=600+i%3 if i<8 else 40, tehsil=f'T{i}', tehsil_lgd=5000+i) for i in range(10)])
     N=ns['norm_code']; TEH['lgd'],TEH['slgd'],TEH['dlgd']=TEH.tehsil_lgd.map(N),TEH.state_lgd.map(N),TEH.district_lgd.map(N)
     TEH['dkey']=TEH.state.map(ns['norm_state'])+'|'+TEH.district.map(ns['norm_name']); TEH['gkey']=TEH.dlgd
     TODAY=ns['TODAY']; TE=ns['TREND_ENDS']; S1S=ns['S1_START']; BINS=ns['RICE_BINS']
@@ -71,7 +71,8 @@ def build(path, work='/tmp/cropintel_test'):
     ns['WORK_DIR']=work; ns['DRIVE_OK']=True
     exec(code['7c'], ns)
     ns['GG'].update({l:{'wwh':[('ir',305,120)],'ri1':[('ir',170,290)]} for l in TEH.lgd[8:]})
-    for cname in ('8','9','10','11','11b'): exec(code[cname], ns)
+    ns['INPUT_DIR'] = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'data')
+    for cname in ('8','9','10','10b','11','11b'): exec(code[cname], ns)
 
     c12 = code['12']; x = c12[c12.index('def clean(v):'):c12.index('def get_ws')] + c12[c12.index('TABS = ['):c12.index("print('💾 Excel")]
     exec(x, ns)

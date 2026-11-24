@@ -108,9 +108,9 @@ def test_07_no_invented_dates(ns, T1, T8):
     for r in T1:
         if 'Recommended sowing window only' in str(r['Sowing Date Evidence']):
             assert r['Sowing Date Estimated'] == '' and r['Sowing Date Confidence'] == ''
-    for r in T8:
-        if r['Sowing Reference Basis'] != 'Observed planting date':
-            assert r['Actual Sowing Date (this season)'] == '' and r['Expected Harvest Date (adjusted)'] == ''
+    for r in T8:                                     # district calendar: observed fields only from tehsils with an observed planting
+        if not r['Tehsils with Observed Planting']:
+            assert r['Observed Planting Date (district median)'] == '' and r['Expected Harvest (from observed planting)'] == ''
     c = dict(crop='Maize', group='Cereals', presence='Probable crop identification')
     out = ns['resolve_unconfirmed'](c, 'Maize', ns['CROP_MODELS']['Maize']['stages'], ns['TODAY'] - dt.timedelta(days=30),
                                     False, 110, 'MAIZE', '', [], False, [])
@@ -161,10 +161,15 @@ def test_11_obs_dates_match(T1):
 # TEST 12 – ideal windows consistent with calendar + stage model
 def test_12_ideal_windows(T8):
     for r in T8:
-        if r['Ideal Sowing Window'] not in ('', 'Not available') and r['Ideal Harvest Window'] not in ('', 'Not available'):
-            s0 = dt.datetime.strptime(r['Ideal Sowing Window'].split(' to ')[0], '%d-%b-%Y').date()
-            h0 = dt.datetime.strptime(r['Ideal Harvest Window'].split(' to ')[0], '%d-%b-%Y').date()
+        sw, hw = r['Ideal Sowing Window (current / next cycle)'], r['Ideal Harvest Window']
+        if ' to ' in sw and ' to ' in hw:
+            s0 = dt.datetime.strptime(sw.split(' to ')[0], '%d-%b-%Y').date()
+            h0 = dt.datetime.strptime(hw.split(' to ')[0], '%d-%b-%Y').date()
+            dur = r['Ideal Crop Duration Days']
             assert h0 > s0, r
+            if '-' in dur:
+                assert (h0 - s0).days == int(dur.split('-')[0]), r     # harvest = sowing + minimum duration
+        assert r['Calendar Source'] and r['Source Confidence (High / Medium / Low)'] in ('High', 'Medium', 'Low')
 
 
 # TEST 13 – machinery only for a valid operation, crop-specific
@@ -176,15 +181,14 @@ def test_13_machinery(ns, T8):
     for r in T8:
         m = r['Machinery Need – Next Stage (Tillage / Seeding / Spraying / Harvesting / None)']
         if m != 'None':
-            assert r['Machinery Recommendation (crop & operation)'] and r['Next Stage Operation']
-        if r['Final Crop Stage (current)'] in ns['UNRESOLVED']:
-            assert m == 'None'
+            assert r['Machinery Recommendation (crop & operation)'] and r['Next Operation']
 
 
 # TEST 14 – consistent geographic keys across sheets
 def test_14_geo_keys(ns):
-    keys = [{r[5] for r in ns['T1_ROWS']}, {r[5] for r in ns['T8_ROWS']}] + [{r[5] for r in ns['IDX_ROWS'][i]} for i in ns['IDX6']]
+    keys = [{r[5] for r in ns['T1_ROWS']}] + [{r[5] for r in ns['IDX_ROWS'][i]} for i in ns['IDX6']]
     assert all(k == keys[0] for k in keys)
+    assert {r[3] for r in ns['T8_ROWS']} <= set(ns['TEH'].dlgd)          # Tab 8 is district level
 
 
 # TEST 15 – model version + evidence on every record
@@ -197,10 +201,69 @@ def test_15_traceability(ns, T1):
 def test_16_regression_headers(ns):
     base = json.load(open(os.path.join(os.path.dirname(__file__), 'baseline_headers.json')))
     assert ns['T1_HEADER'][:len(base['Crop_Intelligence_Current'])] == base['Crop_Intelligence_Current']
-    assert ns['T8_HEADER'][:len(base['Ideal_Crop_Window'])] == base['Ideal_Crop_Window']
+    assert 'Tehsil LGD Code' not in ns['T8_HEADER'] and ns['T8_HEADER'][:4] == base['Ideal_Crop_Window'][:4]   # v4.1 district level
     assert ns['IDX_HEADER'][:len(base['NDVI_MoM'])] == base['NDVI_MoM']
     assert [t[0] for t in ns['TABS']] == base['_tabs']
 
 
 def test_17_in_pipeline_acceptance_all_pass(ns):
     assert not any(ns['ACCEPT'].values()), {k: v for k, v in ns['ACCEPT'].items() if v}
+
+
+# v4.0.1 – regressions for the issues found by the independent audit of RUN-20261124-073719
+def test_18_stage_far_from_days_after_planting_is_rejected(ns):
+    tab = ns['CROP_MODELS']['Maize']['stages']
+    names = [t[0] for t in tab]
+    k_silk = next(k for k, n in enumerate(names) if n.startswith('Silking'))
+    dap = 30                                     # early vegetative
+    assert ns['_dap_inconsistent'](tab, names[k_silk], dap)
+    assert not ns['_dap_inconsistent'](tab, names[ns['stage_index_at'](tab, dap)], dap)
+
+
+def test_19_no_duplicate_tehsil_crop(ns):
+    from collections import Counter
+    assert not [k for k, n in Counter((x[5], x[7]) for x in ns['T1_ROWS']).items() if n > 1]
+
+
+def test_20_unidentified_area_not_double_counted(ns):
+    for lgd in {x[5] for x in ns['T1_ROWS']}:
+        rows = [x for x in ns['T1_ROWS'] if x[5] == lgd]
+        bal = next(a for a in ns['AREA_ROWS'] if str(a['Tehsil LGD Code']) == str(lgd))
+        tot = sum(x[12] or 0 for x in rows if x[9] != 'Candidate – flooded, no canopy rise yet')
+        assert tot <= bal['Active cultivated ha'] + max(1, 0.01 * bal['Active cultivated ha']), (lgd, tot, bal)
+
+
+def test_21_harvest_follows_observed_stage(ns):
+    H8 = ns['T8T_HEADER']
+    for x in ns['T8T_ROWS']:
+        d = dict(zip(H8, x))
+        if d['Expected Harvest Date (adjusted)'] and str(d['Expected Harvest Date (adjusted)']) < str(ns['TODAY']):
+            assert any(w in str(d['Final Crop Stage (current)']) for w in ('Harvest', 'aturity', 'unresolved'))
+
+
+# v4.1 – district crop calendar
+def test_22_calendar_file_integrity(ns):
+    import pandas as pd
+    cal = pd.read_csv(os.path.join(ROOT, 'data', 'tn_district_crop_calendar.csv'), dtype=str, keep_default_na=False)
+    for r in cal.itertuples():
+        assert 1 <= int(r.sow_month_start) <= 12 and 1 <= int(r.sow_month_end) <= 12
+        assert r.source and r.source_confidence in ('High', 'Medium', 'Low')
+        if r.duration_min:
+            assert int(r.duration_min) <= int(r.duration_max)
+        if r.districts not in ('ALL', 'ALL_RICE') and not r.districts.startswith('ALL_EXCEPT:'):
+            for d in r.districts.split(';'):
+                assert ns['_dk'](d) in ns['TN_DISTRICTS'], d
+        if r.source_confidence != 'High':
+            assert r.note, r                                   # every non-High row says why
+
+
+def test_23_district_rows_and_observations(ns, T8):
+    rice_thj = [r for r in T8 if r['District'] == 'Thanjavur' and r['Crop'] == 'Rice']
+    assert {r['Season (Pattam)'] for r in rice_thj} >= {'Kuruvai', 'Samba', 'Late Samba / Thaladi / Pishanam'}
+    assert not [r for r in T8 if r['District'] == 'Thanjavur' and r['Crop'] == 'Rice' and r['Season (Pattam)'] == 'Sornavari']
+    obs = [o for o in ns['OBS_TEH'] if o['crop'] == 'Rice']
+    shown = sum(int(r['Tehsils with Observed Planting'] or 0) for r in T8 if r['Crop'] == 'Rice')
+    assert shown <= len(obs)
+    for r in T8:
+        if r['Tehsils with Observed Planting']:
+            assert r['Observed Planting Date (district median)'] and r['Overall Timing Status (Early / On Time / Late)'] in ('Early', 'On Time', 'Late')

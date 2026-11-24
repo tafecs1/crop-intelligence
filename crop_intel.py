@@ -79,7 +79,7 @@ REFERENCE_AREAS = [
          date='2026-11-14', source='newkerala.com, 14-Nov-2026 – also reports crops "planted about a month ago"'),
 ]
 FIELD_OBS_CSV    = f'{INPUT_DIR}/field_observations.csv'  # OPTIONAL ground truth: tehsil_lgd,crop,stage,observation_date,planting_date
-MODEL_VERSION   = 'CropIntel-v4.0'
+MODEL_VERSION   = 'CropIntel-v4.1'
 RUN_DATE        = os.environ.get('RUN_DATE') or None   # set once per workflow run so all jobs share the same date
 
 
@@ -1745,13 +1745,13 @@ def crops_v3(r, geo_ha, cl_ha, mp, cur_share):
             ev=f'{rice_ha:,.0f} ha of current-season Sentinel-1 paddy pixels (flood → canopy growth)'))
     harv_ha = (f('rice_harv_frac') or 0) * geo_ha
     if harv_ha >= 1:
-        out.append(dict(crop='Rice (paddy)', group='Cereals', model='RICE_HARVESTED', trend=None, area=harv_ha,
+        out.append(dict(crop='Rice (paddy) – harvested this season', group='Cereals', model='RICE_HARVESTED', trend=None, area=harv_ha,
             src='Satellite (current season)', presence='Detected – current-season satellite evidence',
             method=rule + f'; ≥ {RICE_VH_RISE_DB:.0f} dB VH rise (crop grew), cycle ≥ 80 d old, and max Sentinel-2 NDVI in the last 30 d '
                    f'< {RICE_HARVEST_NDVI} → HARVESTED this season (the field may now be fallow or sown to the next crop)',
             alts='Crop failure / lodging (verify)', ev=f'{harv_ha:,.0f} ha of this season\'s paddy pixels now harvested'))
     if recent_ha >= 1:
-        out.append(dict(crop='Rice (paddy)', group='Cereals', model='RICE_RECENT', trend=None, area=recent_ha,
+        out.append(dict(crop='Rice (paddy) – newly transplanted', group='Cereals', model='RICE_RECENT', trend=None, area=recent_ha,
             src='Satellite (current season)', presence='Probable crop identification',
             method=rule + f'; flooded within the last {RICE_RECENT_DAYS} d, canopy growth NOT yet observed → puddled / newly transplanted '
                    'field (or rain-flooded fallow – cannot yet be excluded)',
@@ -1818,7 +1818,9 @@ def crops_v3(r, geo_ha, cl_ha, mp, cur_share):
         cand_src = f'{MIX_NAME} ({mix_how(r)})'
     c_tot = sum(v for _, v in cands) or 1
     cands = sorted([(n, v) for n, v in cands if v >= 100 and v / c_tot >= 0.03], key=lambda x: -x[1])[:6]
-    unknown = active_ha - sum(c['area'] for c in out if c['group'] not in ('Perennial crops', 'Candidate') and c['model'] != 'RICE_RECENT') - per_ha - pend_ha
+    # v4.0.1 (audit I-15): every satellite row is subtracted ONCE – v3.5 left newly transplanted paddy out of the subtraction, so the
+    # unidentified row double-counted it (sum of rows > active cropland in 92 tehsils). Floor at 0 = no double counting by construction.
+    unknown = max(0.0, active_ha - sum(c['area'] for c in out if c['group'] not in ('Perennial crops', 'Candidate')) - per_ha - pend_ha)
     if unknown >= 1:
         out.append(dict(crop='Active cropland – crop unknown', group='Unidentified', model=None, trend='OTH', area=unknown,
             src='Satellite (current season)', presence='Active cropland, crop unknown', prior=cands, prior_src=cand_src,
@@ -1897,6 +1899,12 @@ def stage_index_at(table, dap):
             cur = k
     return 0 if cur is None else cur
 
+def _dap_inconsistent(table, final, dap):
+    names = [t[0] for t in table]
+    k0 = stage_index_at(table, dap)
+    ks = [names.index(p) for p in final.replace(' (transition)', '').split(' → ') if p in names]
+    return bool(ks) and any(abs(k - k0) > 1 for k in ks)
+
 def stage_bounds(table, k, S):
     """Start / end date range of stage k for planting date S (start of k → start of k+1)."""
     st = table[k][1]
@@ -1961,7 +1969,7 @@ def valid_obs_date(v, base):
 
 EVIDENCE_PRESENCE = ('Confirmed – field verified', 'Detected – current-season satellite evidence', 'Probable crop identification')
 DOM_MIN_SHARE = 0.25          # a crop is called "dominant" only if its current-season evidence covers ≥ 25 % of active cropland
-T1_ROWS, T8_ROWS, DOM, DOM_NOTE, AREA_ROWS = [], [], {}, {}, []
+T1_ROWS, T8_ROWS, DOM, DOM_NOTE, AREA_ROWS, OBS_TEH = [], [], {}, {}, [], []
 for r in TEH.itertuples():
     lgd = r.lgd
     geo_ha, cl_ha = GEO_AREA_HA.get(lgd, 0), CL_HA.get(lgd, 0)
@@ -2328,6 +2336,15 @@ for r in TEH.itertuples():
             stage_kind = 'field'
         elif final != UNC and model == 'RICE_HARVESTED':
             stage_kind = 'satellite'
+        elif final != UNC and table and S and s_w >= 0.5 and model != 'RICE_RECENT' and _dap_inconsistent(table, final, (TODAY - S).days):
+            # v4.0.1 (audit I-16): the curve picked a stage > 1 step away from the point days-after-planting (e.g. maize at 51 DAS
+            # reported "Silking – grain filling"); only the tail of the sowing-date uncertainty supported it → not publishable
+            _k0 = table[stage_index_at(table, (TODAY - S).days)][0]
+            stage_note = f'curve stage "{final}" is > 1 stage from the duration-model stage "{_k0}" at {(TODAY - S).days} d – contradicts'
+            final, code, stage_kind, stage_conf, next_s, next_date, why, unres_reason = resolve_unconfirmed(
+                c, model, table, S, True, None, prefix, stage_note, [], False, cal_cands)
+            reason += f' | Stage resolution – {why}'
+            qc.append(f'QC18: {unres_reason} ({stage_note})')
         elif final != UNC:
             stage_kind = 'satellite'
             optical_only = prefix != 'RICE'
@@ -2350,6 +2367,19 @@ for r in TEH.itertuples():
             if k_ is not None:
                 stage_rng = stage_bounds(table, k_, S)
         alt_stages = ', '.join(cn[0] for cn in cal_cands) if cal_cands else ''
+        # v4.0.1 (audit I-17): expected harvest must follow the OBSERVED stage – v3.5 kept a harvest date already in the past while the
+        # crop was still at pod / grain filling. Earliest harvest = start of the current stage + table time from that stage to harvest.
+        if stage_kind in ('satellite', 'model') and table and harvest_lo and stage_rng[0]:
+            _kc = next((k for k, t in enumerate(table) if final.split(' (')[0].split(' →')[0] == t[0]), None)
+            _kh = next((k for k, t in enumerate(table) if t[2] == 'Harvest'), len(table) - 1)
+            if _kc is not None and _kc < _kh:
+                _mid = lambda st: (st[0] + st[1]) / 2 if isinstance(st, tuple) else st
+                _earliest = stage_rng[0] + dt.timedelta(days=int(_mid(table[_kh][1]) - _mid(table[_kc][1])))
+                if harvest_hi < _earliest or harvest_lo + (harvest_hi - harvest_lo) / 2 < TODAY:
+                    _span = harvest_hi - harvest_lo
+                    harvest_lo = max(_earliest, TODAY); harvest_hi = harvest_lo + _span
+                    h_txt += f' | ADJUSTED to the observed stage: harvest {wtxt(harvest_lo, harvest_hi)}'
+                    qc.append('QC19: calendar harvest date was earlier than the observed stage allows – harvest window moved later')
         dq_status = 'Good' if (share >= 0.5 and ph and ph['n'] >= 8) else ('Fair' if share >= 0.2 else 'Poor')
         qc.insert(0, f'Data quality: {dq_status}')
 
@@ -2488,6 +2518,9 @@ for r in TEH.itertuples():
             nb, next_s, next_date = None, '', None
         m_cat, m_op, m_eq = machinery_for(model, nb)
         obs_S = S if (S and s_w >= 0.5) else None
+        if stage_kind in ('satellite', 'model', 'field') and obs_S and (c['area'] or 0) > 0:     # v4.1 input for the district calendar
+            OBS_TEH.append(dict(dlgd=r.dlgd, lgd=lgd, crop=('Rice' if prefix == 'RICE' else c['crop']), S=obs_S, area=c['area'],
+                                stage=final, kind=stage_kind))
         T8_ROWS.append([r.state, r.slgd, r.district, r.dlgd, r.tehsil, lgd, c['crop'], season_lbl, final,
             ideal_src, ideal_conf, wtxt(*w_sow) if w_sow else NA, wtxt(*ideal_h) if ideal_h else NA, dur_txt or NA,
             (ds(obs_S) + (' (transplanting' if prefix == 'RICE' else ' (sowing') + (', estimated from satellite)' if s_w < 1 else ', field record)')) if obs_S else '', sow_dev, timing or NA,
@@ -2508,12 +2541,13 @@ for r in TEH.itertuples():
     _agg = {}
     for x in mine:
         if x[9] in EVIDENCE_PRESENCE or x[7] == 'Perennial / plantation crops (type not separable)':
-            _agg[x[7]] = _agg.get(x[7], 0) + (x[12] or 0)
+            _k = x[7].split(' – ')[0] if x[7].startswith('Rice (paddy)') else x[7]
+            _agg[_k] = _agg.get(_k, 0) + (x[12] or 0)
     _unk = sum(x[12] or 0 for x in mine if x[7] == 'Active cropland – crop unknown')
     _prior = next((x[68] for x in mine if x[7] == 'Active cropland – crop unknown'), '')
     if _agg and max(_agg.values()) / _act >= DOM_MIN_SHARE:
         _crop, _a = max(_agg.items(), key=lambda kv: kv[1])
-        _row = max((x for x in mine if x[7] == _crop), key=lambda x: x[12] or 0)
+        _row = max((x for x in mine if x[7] == _crop or x[7].startswith(_crop + ' – ')), key=lambda x: x[12] or 0)
         DOM[lgd] = (_crop, _row[8], _row[23])
         DOM_NOTE[lgd] = (f'Dominant crop = largest crop with current-season evidence: {_crop} {_a:,.0f} ha = {min(1, _a / _act):.0%} of '
                          f'active cropland ({_row[9]}; stage: {_row[65]}); unidentified active cropland {_unk:,.0f} ha')
@@ -2538,6 +2572,269 @@ for r in TEH.itertuples():
 
 T1_BY_KIND = Counter(x[65] for x in T1_ROWS)
 print(f'✅ Tab 1 rows: {len(T1_ROWS)} | Tab 8 rows: {len(T8_ROWS)} | ' + ' | '.join(f'{k}: {v}' for k, v in T1_BY_KIND.items()))
+
+
+# ===== CELL 10b: Tab 8 – Ideal_Crop_Window at DISTRICT level (v4.1) =====
+# One row per district × crop × season from the sourced district crop calendar (data/tn_district_crop_calendar.csv, built from the
+# TNAU Agritech "Seasons & Varieties" pages and the TNAU Crop Production Guide). Tehsil-level calendars were dropped: TNAU publishes
+# calendars per district / zone, so a tehsil row only repeated (or mis-assigned) the district recommendation. Current-season
+# observations are aggregated from tehsils WITH an observed planting date (Sentinel-1 / green-up) – never from calendar assumptions.
+import calendar
+T8T_HEADER, T8T_ROWS = T8_HEADER, T8_ROWS          # tehsil-level rows kept internally only (acceptance tests, not written)
+CAL_FILE = 'tn_district_crop_calendar.csv'
+CAL_CROP_MODEL = {'Rice': 'RICE', 'Maize': 'Maize', 'Groundnut': 'Groundnut', 'Cotton': 'Cotton', 'Black gram': 'Black gram',
+                  'Green gram': 'Green gram', 'Sugarcane': 'Sugarcane'}
+CAL_FAMILY = {'Pearl millet (Cumbu)': 'millet', 'Finger millet (Ragi)': 'millet', 'Sorghum (Cholam)': 'millet', 'Red gram': 'pulses',
+              'Bengal gram (Chickpea)': 'pulses', 'Sesame (Gingelly)': 'sesame', 'Sunflower': 'sunflower'}
+MACHINERY.update({
+    ('millet', 'Land Prep'): ('Land preparation', 'Cultivator / rotavator'), ('millet', 'Sowing'): ('Sowing', 'Seed drill'),
+    ('millet', 'Harvest'): ('Harvesting + threshing', 'Reaper or manual harvest; multi-crop thresher'),
+    ('sesame', 'Land Prep'): ('Land preparation', 'Cultivator / rotavator'), ('sesame', 'Sowing'): ('Sowing', 'Seed drill (sand-mixed seed)'),
+    ('sesame', 'Harvest'): ('Harvesting + threshing', 'Manual cutting, drying and threshing; multi-crop thresher'),
+    ('sunflower', 'Land Prep'): ('Land preparation', 'Cultivator / rotavator; ridger'), ('sunflower', 'Sowing'): ('Sowing', 'Planter / seed drill'),
+    ('sunflower', 'Harvest'): ('Head harvesting + threshing', 'Manual head cutting; sunflower thresher'),
+})
+DIST_ALIAS = {'trichy': 'tiruchirappalli', 'tiruchirapalli': 'tiruchirappalli', 'thoothukudi': 'tuticorin', 'kanyakumari': 'kanniyakumari',
+              'sivagangai': 'sivaganga', 'tiruvarur': 'thiruvarur', 'tiruvallur': 'thiruvallur', 'kancheepuram': 'kanchipuram',
+              'tirupur': 'tiruppur', 'pudukottai': 'pudukkottai', 'perumbalur': 'perambalur', 'namakal': 'namakkal',
+              'nilgiris': 'the nilgiris', 'tirupattur': 'tirupathur', 'ramnad': 'ramanathapuram', 'villuppuram': 'villupuram'}
+DIST_CHILD = {'kanchipuram': ['chengalpattu'], 'tirunelveli': ['tenkasi'], 'villupuram': ['kallakurichi'], 'vellore': ['ranipet', 'tirupathur'],
+              'nagapattinam': ['mayiladuthurai']}       # districts created after the source tables were written
+TN_DISTRICTS = {'ariyalur', 'chengalpattu', 'chennai', 'coimbatore', 'cuddalore', 'dharmapuri', 'dindigul', 'erode', 'kallakurichi',
+                'kanchipuram', 'kanniyakumari', 'karur', 'krishnagiri', 'madurai', 'mayiladuthurai', 'nagapattinam', 'namakkal',
+                'perambalur', 'pudukkottai', 'ramanathapuram', 'ranipet', 'salem', 'sivaganga', 'tenkasi', 'thanjavur', 'the nilgiris',
+                'theni', 'thiruvallur', 'thiruvarur', 'tiruchirappalli', 'tirunelveli', 'tirupathur', 'tiruppur', 'tiruvannamalai',
+                'tuticorin', 'vellore', 'villupuram', 'virudhunagar'}      # the 38 LGD districts (names as in the LGD boundary file)
+def _dk(n):
+    k = re.sub(r'\s+', ' ', str(n).strip().lower())
+    return DIST_ALIAS.get(k, k)
+
+def load_district_calendar():
+    for d in [globals().get('INPUT_DIR'), DRIVE_DIR, os.path.dirname(os.path.abspath(globals().get('__file__', '.'))), 'data']:
+        if d and os.path.exists(os.path.join(d, CAL_FILE)):
+            return pd.read_csv(os.path.join(d, CAL_FILE), dtype=str, keep_default_na=False)
+    return None
+
+DIST_TAB = TEH.drop_duplicates('dlgd')[['state', 'slgd', 'district', 'dlgd']]
+CAL = load_district_calendar()
+DCAL_ROWS, DCAL_QC = [], Counter()
+if CAL is not None:
+    tn_d = {_dk(x.district): x for x in DIST_TAB.itertuples() if norm_state(x.state) == 'TAMIL NADU'}
+    rice_d = set()
+    def _expand(spec, crop):
+        if spec == 'ALL':
+            out = TN_DISTRICTS - {'chennai'}
+        elif spec.startswith('ALL_EXCEPT:'):
+            out = TN_DISTRICTS - {'chennai'} - {_dk(n) for n in spec.split(':', 1)[1].split(';')}
+        elif spec == 'ALL_RICE':
+            out = set(rice_d)
+        else:
+            out = {_dk(n) for n in spec.split(';') if n.strip()}
+        inherited = {}
+        for par, kids in DIST_CHILD.items():
+            if par in out:
+                for k in kids:
+                    if k not in out:
+                        inherited[k] = par
+        unknown = {k for k in out | set(inherited) if k not in TN_DISTRICTS}
+        assert not unknown, f'calendar district names are not Tamil Nadu LGD districts: {unknown}'
+        keep = {k for k in out | set(inherited) if k in tn_d}          # only districts inside this run
+        return keep, {k: v for k, v in inherited.items() if k in keep}
+    for row in CAL[CAL.crop == 'Rice'].itertuples():
+        if row.districts not in ('ALL_RICE',):
+            rice_d |= {_dk(n) for n in row.districts.split(';')}
+            rice_d |= {k for par, kids in DIST_CHILD.items() if par in rice_d for k in kids}
+
+    def _cycle(m1, m2, dmax):
+        """Sowing window of the cycle that is running now (sown ≤ dmax days ago) or the next one."""
+        best = None
+        for y in (TODAY.year - 1, TODAY.year, TODAY.year + 1):
+            a = dt.date(y, m1, 1)
+            b = dt.date(y + (1 if m2 < m1 else 0), m2, calendar.monthrange(y + (1 if m2 < m1 else 0), m2)[1])
+            if a - dt.timedelta(days=0) <= TODAY + dt.timedelta(days=365) and b + dt.timedelta(days=(dmax or 120) + 15) >= TODAY:
+                if best is None or a < best[0]:
+                    best = (a, b)
+        return best
+
+    # each observed tehsil is assigned to ONE season row: the one whose sowing (rice: transplanting) window is nearest its
+    # observed planting date and contains it ±15/30 d – overlapping seasons (e.g. Late Samba / Late Thaladi) never double count
+    _win = {}
+    for i_, cr in enumerate(CAL.itertuples()):
+        w_ = _cycle(int(cr.sow_month_start), int(cr.sow_month_end), int(cr.duration_max) if cr.duration_max else None)
+        if w_ and cr.crop == 'Rice':
+            w_ = (w_[0] + dt.timedelta(days=18), w_[1] + dt.timedelta(days=40))
+        _win[i_] = w_
+    OBS_ROW = {}
+    for k_, o in enumerate(OBS_TEH):
+        best = None
+        for i_, cr in enumerate(CAL.itertuples()):
+            w_ = _win[i_]
+            if cr.crop != o['crop'] or not w_:
+                continue
+            tol = dt.timedelta(days=15 if cr.crop == 'Rice' else 30)
+            if not (w_[0] - tol <= o['S'] <= w_[1] + tol):
+                continue
+            ex_ = cr.districts
+            names = None if (ex_ in ('ALL', 'ALL_RICE') or ex_.startswith('ALL_EXCEPT:')) else {_dk(n) for n in ex_.split(';')}
+            dname = _dk(DIST_TAB.set_index('dlgd').district.get(o['dlgd'], ''))
+            if names is not None and dname not in names and not any(dname in kids and par in names for par, kids in DIST_CHILD.items()):
+                continue
+            if ex_ == 'ALL_RICE' and dname not in rice_d:
+                continue
+            if ex_.startswith('ALL_EXCEPT:') and dname in {_dk(n) for n in ex_.split(':', 1)[1].split(';')}:
+                continue
+            gap = abs((o['S'] - (w_[0] + (w_[1] - w_[0]) / 2)).days)
+            if best is None or gap < best[0]:
+                best = (gap, i_)
+        if best:
+            OBS_ROW[k_] = best[1]
+    for i_cal, cr in enumerate(CAL.itertuples()):
+        dmin = int(cr.duration_min) if cr.duration_min else None
+        dmax = int(cr.duration_max) if cr.duration_max else None
+        m1, m2 = int(cr.sow_month_start), int(cr.sow_month_end)
+        dists, inherited = _expand(cr.districts, cr.crop)
+        model = CAL_CROP_MODEL.get(cr.crop)
+        fam = CROP_FAMILY.get(model) if model else CAL_FAMILY.get(cr.crop)
+        w = _cycle(m1, m2, dmax)
+        harvest_w = (w[0] + dt.timedelta(days=dmin), w[1] + dt.timedelta(days=dmax)) if (w and dmin and dmax) else None
+        rice = model == 'RICE'
+        if rice:                       # TNAU rice months = nursery sowing; transplanting 18-40 d later (REFS TNAU_RICE_NURSERY)
+            tw = (w[0] + dt.timedelta(days=18), w[1] + dt.timedelta(days=40)) if w else None
+        # status today
+        if not w:
+            status = 'Off-season'
+        elif TODAY < w[0]:
+            status = f'Upcoming – sowing window opens in {(w[0] - TODAY).days} d'
+        elif TODAY <= w[1]:
+            status = 'Sowing window open'
+        elif harvest_w and harvest_w[0] <= TODAY <= harvest_w[1]:
+            status = 'Harvest window (by calendar)'
+        elif harvest_w and TODAY > harvest_w[1]:
+            status = 'Completed (by calendar)'
+        else:
+            status = 'Crop in field (by calendar)'
+        # stage buckets (ideal), from the crop's sourced stage table only
+        table = None
+        if rice and dmin:
+            F = int((dmin + dmax) / 2) - 25 if dmax else None
+            table = [(n, d_, bk) for n, d_, bk, _ in rice_stage_table(F)] if F else None
+            base = tw
+        elif model in CROP_MODELS:
+            table = [(t[0], t[1], t[2]) for t in CROP_MODELS[model]['stages']]
+            base = w
+        buckets = {}
+        if table and w:
+            for n, d_, bk in table:
+                lo, hi = (d_ if isinstance(d_, tuple) else (d_, d_))
+                a, b = base[0] + dt.timedelta(days=lo), base[1] + dt.timedelta(days=hi)
+                if bk in buckets:
+                    buckets[bk] = (min(buckets[bk][0], a), max(buckets[bk][1], b))
+                else:
+                    buckets[bk] = (a, b)
+        elif w:
+            buckets['Land Prep'] = (w[0] - dt.timedelta(days=30), w[1] - dt.timedelta(days=1))
+            buckets['Sowing'] = w
+            if harvest_w:
+                buckets['Harvest'] = harvest_w
+        if harvest_w:
+            buckets['Harvest'] = harvest_w
+        exp_stage = ''
+        if table and w and base and base[0] <= TODAY:
+            names = []
+            for S_ in (base[0], base[1]):
+                if S_ <= TODAY:
+                    names.append(table[max(0, min(len(table) - 1, sum(1 for n, d_, bk in table
+                                  if (TODAY - S_).days >= ((d_[0] + d_[1]) / 2 if isinstance(d_, tuple) else d_)) - 1))][0])
+            exp_stage = ' … '.join(dict.fromkeys(names)) + ' (calendar expectation if sown in the window – NOT observed)'
+        for dk in sorted(dists):
+            dr = tn_d[dk]
+            qc = []
+            if dk in inherited:
+                qc.append(f'calendar inherited from parent district {inherited[dk].title()} (district created after the source table)')
+            if cr.source_confidence != 'High':
+                qc.append(f'source confidence {cr.source_confidence}: {cr.note}')
+            # ---- observed (current season) for this district × crop × season
+            obs = [o for k_, o in enumerate(OBS_TEH) if o['dlgd'] == dr.dlgd and OBS_ROW.get(k_) == i_cal]
+            o_area = round(sum(o['area'] for o in obs), 1) if obs else ''
+            o_S = o_dev = o_timing = o_stage = o_harv = o_days = ''
+            if obs:
+                srt = sorted(obs, key=lambda o: o['S'])
+                half, acc = sum(o['area'] for o in srt) / 2, 0
+                for o in srt:
+                    acc += o['area']
+                    if acc >= half:
+                        o_S = o['S']; break
+                ref_w = tw if rice else w
+                o_dev = (o_S - ref_w[1]).days if o_S > ref_w[1] else (o_S - ref_w[0]).days if o_S < ref_w[0] else 0
+                o_timing = 'Late' if o_dev > 0 else 'Early' if o_dev < 0 else 'On Time'
+                st_area = Counter()
+                for o in obs:
+                    st_area[o['stage'].replace(' (model-inferred)', '')] += o['area']
+                o_stage = st_area.most_common(1)[0][0] + (f' ({st_area.most_common(1)[0][1] / sum(st_area.values()):.0%} of observed area)'
+                                                         if len(st_area) > 1 else '')
+                if dmin and dmax:
+                    fd = ((dmin - 32, dmax - 18) if rice else (dmin, dmax))
+                    hl, hh = o_S + dt.timedelta(days=fd[0]), o_S + dt.timedelta(days=fd[1])
+                    o_harv = wtxt(hl, hh); o_days = max(0, (hl - TODAY).days)
+                if any(o['kind'] == 'model' for o in obs):
+                    qc.append('part of the observed stage is model-inferred (observed planting + durations)')
+            # ---- next operation + machinery (calendar status, refined by the observed stage)
+            nb = None
+            if o_stage and table:
+                cur = next((k for k, t in enumerate(table) if o_stage.startswith(t[0])), None)
+                if cur is not None and cur + 1 < len(table):
+                    nb = table[cur + 1][2]
+            elif status.startswith('Upcoming') and w and (w[0] - TODAY).days <= 45:
+                nb = 'Land Prep'
+            elif status == 'Sowing window open':
+                nb = 'Sowing'
+            elif status.startswith('Harvest window'):
+                nb = 'Harvest'
+            op, eq = MACHINERY.get((fam, nb), ('', '')) if (fam and nb) else ('', '')
+            m_cat = MACHINERY_BY_BUCKET.get(nb, 'None') if eq else 'None'
+            nwin = wtxt(*buckets[nb]) if (nb and nb in buckets) else ''
+            DCAL_QC[cr.source_confidence] += 1
+            DCAL_ROWS.append([dr.state, dr.slgd, dr.district, dr.dlgd, cr.crop, cr.season, cr.irrigation,
+                f'{cr.source}', cr.source_confidence, cr.note, cr.varieties,
+                wtxt(*w) if w else NA, wtxt(*harvest_w) if harvest_w else NA,
+                (f'{dmin}-{dmax}' if dmin and dmax and dmin != dmax else (str(dmin) if dmin else 'Not stated by source')), cr.duration_note,
+                status, exp_stage, o_area, len({o['lgd'] for o in obs}) if obs else 0, ds(o_S) if o_S else '', o_dev, o_timing or NA,
+                o_stage, o_harv, o_days, op or ('No machine operation due' if nb else ''), nwin, m_cat, eq]
+                + [x for bk in STAGE_BUCKETS for x in ((ds(buckets[bk][0]), ds(buckets[bk][1])) if bk in buckets else ('', ''))]
+                + ['; '.join(qc), MODEL_VERSION, RUN_ID])
+else:
+    print('⚠️ district crop calendar file not found – Tab 8 will only hold GGCMI / national-window rows')
+# ---- states outside Tamil Nadu: one row per district × modelled crop from GGCMI (0.5°) or the broad national windows
+for x in DIST_TAB.itertuples():
+    if norm_state(x.state) == 'TAMIL NADU':
+        continue
+    lg = TEH[TEH.dlgd == x.dlgd].lgd.iloc[0]
+    for model in ['RICE'] + list(CROP_MODELS):
+        wins = sow_windows(model, x.state, lg, TODAY + dt.timedelta(days=120))
+        for nm, w, dur in wins:
+            dmin, dmax = (dur - 15, dur + 15) if dur else ((CROP_MODELS[model]['harvest']) if model in CROP_MODELS else (None, None))
+            hw = (w[0] + dt.timedelta(days=dmin), w[1] + dt.timedelta(days=dmax)) if dmin else None
+            DCAL_ROWS.append([x.state, x.slgd, x.district, x.dlgd, 'Rice' if model == 'RICE' else model, nm, '',
+                'GGCMI Phase 3 (0.5°) / national window', 'Low', 'no district-specific calendar loaded for this state', '',
+                wtxt(*w), wtxt(*hw) if hw else NA, f'{dmin}-{dmax}' if dmin else 'Not stated by source', '', '', '', '', 0, '', '', NA,
+                '', '', '', '', '', 'None', ''] + [''] * (2 * len(STAGE_BUCKETS)) + ['', MODEL_VERSION, RUN_ID])
+UNASSIGNED_OBS = [o for k_, o in enumerate(OBS_TEH) if k_ not in globals().get('OBS_ROW', {}) and o['crop'] in set(CAL.crop if CAL is not None else [])
+                  and norm_state(TEH.set_index('lgd').state.get(o['lgd'], '')) == 'TAMIL NADU']
+if UNASSIGNED_OBS:
+    print(f'   ⚠️ {len(UNASSIGNED_OBS)} observed tehsil plantings fall outside every TNAU window of their district (listed in QC_Summary)')
+T8_HEADER = ['State', 'State LGD Code', 'District', 'District LGD Code', 'Crop', 'Season (Pattam)', 'Irrigation',
+             'Calendar Source', 'Source Confidence (High / Medium / Low)', 'Source Note', 'Recommended Varieties (TNAU)',
+             'Ideal Sowing Window (current / next cycle)', 'Ideal Harvest Window', 'Ideal Crop Duration Days', 'Duration Source',
+             'Calendar Status (today)', 'Expected Stage by Calendar (not observed)',
+             'Observed Crop Area Ha (current season, satellite)', 'Tehsils with Observed Planting', 'Observed Planting Date (district median)',
+             'Sowing Deviation Days (+ late / − early)', 'Overall Timing Status (Early / On Time / Late)', 'Observed Current Stage (district)',
+             'Expected Harvest (from observed planting)', 'Days to Harvest', 'Next Operation', 'Next Operation Window',
+             'Machinery Need – Next Stage (Tillage / Seeding / Spraying / Harvesting / None)', 'Machinery Recommendation (crop & operation)'] + \
+            [f'{bk} – Ideal {se}' for bk in STAGE_BUCKETS for se in ('Start', 'End')] + ['QC Flags', 'Model Version', 'Run ID']
+T8_ROWS = DCAL_ROWS
+assert all(len(x) == len(T8_HEADER) for x in T8_ROWS), 'Tab 8 row width mismatch'
+print(f'✅ Tab 8 (district calendar): {len(T8_ROWS)} rows for {len({x[3] for x in T8_ROWS})} districts | source confidence: '
+      + ', '.join(f'{k} {v}' for k, v in DCAL_QC.items()) + f' | rows with observed planting: {sum(1 for x in T8_ROWS if x[19])}')
 
 
 # ===== CELL 11: Tabs 2–7 – index MoM tabs (one row per tehsil, 24 months across) =====
@@ -2641,8 +2938,23 @@ ACCEPT['T8 identified area ≤ active cropland (no double counting)'] = [a['Tehs
 ACCEPT['T10 no % change on negative / near-zero index baselines'] = [rw[5] for idx in IDX6 for rw in IDX_ROWS[idx]
     for k in range(len(MONTH_LABELS)) if k > 0 and rw[VAL_COL[k] + 1] is not None and (rw[VAL_COL[k - 1]] is None or rw[VAL_COL[k - 1]] < 0.05)]
 ACCEPT['T11 stage observation date ≤ latest acquisition date'] = [x[5] for x in T1_ROWS if x[26] and x[61] and str(x[26]) > str(x[61])]
-ACCEPT['T13 machinery only for a valid next operation'] = [x[5] for x in T8_ROWS if x[21] not in ('None', '') and not x[52]]
-_keys = [set(TEH.lgd), {x[5] for x in T1_ROWS}, {x[5] for x in T8_ROWS}] + [{rw[5] for rw in IDX_ROWS[i]} for i in IDX6]
+_H8 = {h: k for k, h in enumerate(T8_HEADER)}
+ACCEPT['T13 machinery only for a valid next operation'] = [(x[3], x[4], x[5]) for x in T8_ROWS
+    if x[_H8['Machinery Need – Next Stage (Tillage / Seeding / Spraying / Harvesting / None)']] not in ('None', '')
+    and not x[_H8['Machinery Recommendation (crop & operation)']]]
+ACCEPT['T12 district calendar windows consistent with crop durations'] = [(x[3], x[4], x[5]) for x in T8_ROWS
+    if ' to ' in str(x[_H8['Ideal Sowing Window (current / next cycle)']]) and ' to ' in str(x[_H8['Ideal Harvest Window']]) and not (
+        dt.datetime.strptime(x[_H8['Ideal Harvest Window']].split(' to ')[0], '%d-%b-%Y') >
+        dt.datetime.strptime(x[_H8['Ideal Sowing Window (current / next cycle)']].split(' to ')[0], '%d-%b-%Y'))]
+ACCEPT['T19 every district calendar row is sourced'] = [(x[3], x[4], x[5]) for x in T8_ROWS
+    if not str(x[_H8['Calendar Source']]).strip() or not str(x[_H8['Source Confidence (High / Medium / Low)']]).strip()]
+ACCEPT['T16 no duplicate (tehsil, crop) records'] = [k for k, n in Counter((x[5], x[7]) for x in T1_ROWS).items() if n > 1]
+_H8T = {h: k for k, h in enumerate(T8T_HEADER)}
+ACCEPT['T17 expected harvest not past while crop is before harvest'] = [x[5] for x in T8T_ROWS
+    if x[_H8T['Expected Harvest Date (adjusted)']] and str(x[_H8T['Expected Harvest Date (adjusted)']]) < str(TODAY)
+    and not any(w in str(x[8]) for w in ('Harvest', 'maturity', 'Maturity', 'unresolved', 'Fallow'))]
+_keys = [set(TEH.lgd), {x[5] for x in T1_ROWS}] + [{rw[5] for rw in IDX_ROWS[i]} for i in IDX6]
+ACCEPT['T14b Tab 8 districts are LGD districts'] = sorted({x[3] for x in T8_ROWS} - set(TEH.dlgd))
 ACCEPT['T14 consistent geographic keys across sheets'] = sorted(set.union(*_keys) - set.intersection(*_keys))
 ACCEPT['T15 model version + source on every record'] = [x[5] for x in T1_ROWS if x[53] != MODEL_VERSION or not str(x[54]).strip()]
 for k_, v_ in ACCEPT.items():
@@ -2670,6 +2982,9 @@ QC_SUMMARY = pd.concat([
     pd.DataFrame([{'Section': 'Area reconciliation failures', 'Item': a['Tehsil'], 'Value': a['Overlap check']}
                   for a in AREA_ROWS if a['Overlap check'] != 'OK']),
     pd.DataFrame([{'Section': 'Acceptance tests', 'Item': k, 'Value': 'PASS' if not v else f'FAIL ({len(v)})'} for k, v in ACCEPT.items()]),
+    pd.DataFrame([{'Section': 'Observed planting outside every TNAU district window', 'Item': f"{o['lgd']} {o['crop']} {o['S']}",
+                   'Value': round(o['area'])} for o in UNASSIGNED_OBS]),
+    pd.DataFrame([{'Section': 'District calendar rows by source confidence', 'Item': k, 'Value': v} for k, v in DCAL_QC.items()]),
     pd.DataFrame([{'Section': 'Duplicate spatial IDs', 'Item': 'Tehsil LGD codes appearing twice in TEH', 'Value': int(TEH.lgd.duplicated().sum())}]),
 ], ignore_index=True)
 STAGE_REPORT = {
@@ -2733,7 +3048,7 @@ for ref in REFERENCE_AREAS:
     if not len(teh):
         continue
     keep = set(teh.lgd)
-    est = sum(x[12] or 0 for x in T1_ROWS if x[7] == 'Rice (paddy)' and x[5] in keep)   # standing + recent + harvested paddy
+    est = sum(x[12] or 0 for x in T1_ROWS if x[7].startswith('Rice (paddy)') and x[5] in keep)   # standing + recent + harvested paddy
     old = sum((fnum(SAT_MAPS.get(l, {}).get('rice_frac_v30')) or 0) * GEO_AREA_HA.get(l, 0) for l in teh.lgd)
     ratio = est / ref['ha'] if ref['ha'] else None
     verdict = ('within reference' if ref['kind'] == 'upper_bound' and est <= ref['ha'] else
@@ -2865,6 +3180,8 @@ with pd.ExcelWriter(XLSX) as xw:
         _df.to_excel(xw, sheet_name='Stage_Report', index=False, startrow=_r0 + 1)
         _r0 += len(_df) + 4
     PHENO_DB.to_excel(xw, sheet_name='Crop_Phenology_DB', index=False)
+    if CAL is not None:
+        CAL.to_excel(xw, sheet_name='District_Calendar_Source', index=False)          # v4.1 sourced calendar used for Tab 8
 PHENO_DB.to_csv(f'{WORK_DIR}/crop_phenology_db.csv', index=False)
 with open(f'{WORK_DIR}/stage_report.md', 'w') as fh:
     fh.write(f'# CropIntel stage report – {RUN_ID} ({MODEL_VERSION})\n\n')
