@@ -267,3 +267,19 @@ def test_23_district_rows_and_observations(ns, T8):
     for r in T8:
         if r['Tehsils with Observed Planting']:
             assert r['Observed Planting Date (district median)'] and r['Overall Timing Status (Early / On Time / Late)'] in ('Early', 'On Time', 'Late')
+
+
+def test_22_extraction_gate_blocks_missing_maps():
+    """v4.2: if crop-map / trend extraction failed, the run must stop – never publish tehsils as fallow."""
+    import pathlib, pytest
+    src = pathlib.Path(__file__).resolve().parents[1].joinpath('crop_intel.py').read_text()
+    a = src.index('# v4.2 extraction completeness gate')
+    b = src.index("'the Earth Engine error, fix it and re-run (completed batches are cached).')") + len("'the Earth Engine error, fix it and re-run (completed batches are cached).')")
+    gate = src[a:b]
+    base = dict(_batches=[['1', '2', '3']], TREND_STEPS=12, MIN_EXTRACT_COVERAGE=0.95,
+                SAT_MONTHLY={'1': {}, '2': {}, '3': {}}, SAT_CUR={k: {'crop_share': 0.5} for k in '123'}, SAT_WX={})
+    ok = dict(base, SAT_MAPS={k: {'active_frac': 0.4} for k in '123'}, SAT_TREND={k: {'NDVI_T00': 0.3} for k in '123'})
+    exec(gate, dict(ok))                                         # complete → passes
+    bad = dict(base, SAT_MAPS={}, SAT_TREND={})
+    with pytest.raises(SystemExit):
+        exec(gate, dict(bad))                                    # maps/trend missing → stops

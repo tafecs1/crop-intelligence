@@ -136,3 +136,11 @@ on every regenerated workbook before releasing it.
   Observations outside every TNAU window are listed in QC_Summary.
 * **Dashboard:** join Tab 8 on **District LGD Code** (it no longer has Tehsil columns).
 * **Tests:** 23 tests pass, including calendar file integrity, district coverage, observation assignment and harvest = sowing + duration.
+
+## 9. v4.2 – audit of RUN-20261124-130006 (Crop_Intelligence (3).xlsx)
+
+| ID | Finding | Fix |
+|---|---|---|
+| I-19 | All 291 Tamil Nadu tehsils published as "Fallow – no active crop" (0 ha). QC14 on every row: the crop-map (MAPS) and 14-day trend (TREND) Earth Engine reductions returned no data for any tehsil, while monthly / current / weather layers worked. The run still wrote the Sheet. | **Extraction completeness gate** after Cell 7: coverage of monthly, current, maps and trend must be ≥ 95 % of cropland tehsils, otherwise the run stops before writing anything and prints the missing tehsils. A tehsil whose crop maps are missing is labelled "Satellite crop layers missing – not assessed", never fallow. Test 22. **Root cause (extract log of RUN-20261124-123259):** `Expected a homogeneous image collection … band 'm': Float<-1, 1>` – the v4.0 optical water check merged Sentinel-2 MNDWI (`normalizedDifference`, range-typed float) with a plain-float placeholder image; Earth Engine rejected the collection, so every TREND and MAPS batch failed (trend 0 · maps 0). Fixed: no merge for MNDWI (the S2 collection already has a masked placeholder) and Dynamic World uses `If(size > 0)`. |
+| I-20 | Tab 8 rice "Sowing" stage columns used 18-40 d seedling age for every rice season | seedling age by duration class (TNAU: short 18-22, medium 25-30, long 35-40 d); QC note that the rice sowing window is nursery sowing and the stage columns are transplanting |
+| I-21 | Tab 8 "Expected Stage by Calendar" listed stages late → early ("Physiological maturity … Grain filling – dough") | listed early → late |

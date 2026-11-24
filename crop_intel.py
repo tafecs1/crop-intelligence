@@ -79,7 +79,8 @@ REFERENCE_AREAS = [
          date='2026-11-14', source='newkerala.com, 14-Nov-2026 – also reports crops "planted about a month ago"'),
 ]
 FIELD_OBS_CSV    = f'{INPUT_DIR}/field_observations.csv'  # OPTIONAL ground truth: tehsil_lgd,crop,stage,observation_date,planting_date
-MODEL_VERSION   = 'CropIntel-v4.1'
+MODEL_VERSION   = 'CropIntel-v4.2'
+MIN_EXTRACT_COVERAGE = 0.95                 # v4.2: stop before writing if crop maps / trends are missing for > 5 % of cropland tehsils
 RUN_DATE        = os.environ.get('RUN_DATE') or None   # set once per workflow run so all jobs share the same date
 
 
@@ -637,11 +638,14 @@ def rice_layers(region, vh_th=None, vv_th=None, drop_db=None, rise_db=None, core
         # flooding period – Dynamic World (water or flooded-vegetation probability ≥ 0.3) OR Sentinel-2 MNDWI ≥ 0. Rain-wetted
         # black (vertisol) soil darkens radar like puddling but is rarely seen as open water optically (Tuticorin / Virudhunagar
         # false paddy in v3.5). Cloud-free evidence is required, so this can only REMOVE pixels, never add them.
-        dwp = (DW.filterBounds(region).filterDate(str(RICE_FLOOD_START), str(TODAY + dt.timedelta(days=1)))
-               .map(lambda i: i.select('water').add(i.select('flooded_vegetation')).rename('w'))
-               .merge(ee.ImageCollection([EMPTY_1('w')])).max())
+        # v4.2 fix (RUN-20261124-123259: "Expected a homogeneous image collection … band 'm': Float<-1, 1>"): normalizedDifference
+        # returns a range-typed float that cannot be merged with the plain-float placeholder image, which failed EVERY trend and
+        # crop-map batch. No merge any more: s2_collection already contains a masked placeholder, and Dynamic World uses If().
+        _dwc = (DW.filterBounds(region).filterDate(str(RICE_FLOOD_START), str(TODAY + dt.timedelta(days=1)))
+                .map(lambda i: i.select('water').add(i.select('flooded_vegetation')).toFloat().rename('w')))
+        dwp = ee.Image(ee.Algorithms.If(_dwc.size().gt(0), _dwc.max(), EMPTY_1('w')))
         mndwi = (s2_collection(RICE_FLOOD_START, TODAY + dt.timedelta(days=1), region)
-                 .map(lambda i: i.normalizedDifference(['B3', 'B11']).rename('m')).merge(ee.ImageCollection([EMPTY_1('m')])).max())
+                 .map(lambda i: i.normalizedDifference(['B3', 'B11']).rename('m')).max())
         base = base.And(dwp.gte(0.3).Or(mndwi.gte(0.0)).unmask(0))
     est_all = base.And(rise.gte(rise_db)).unmask(0)
     if core_only:                                            # calibration: paddy this season (standing + harvested) + recently flooded
@@ -1047,6 +1051,27 @@ print(f'✅ Extraction done: monthly {len(SAT_MONTHLY)} · trend {len(SAT_TREND)
 if EXTRACT_ONLY:
     print('Extraction-only shard finished – cache saved in', CACHE_DIR)
     sys.exit(0)
+
+# v4.2 extraction completeness gate: a tehsil whose crop-map / trend reduction failed must NEVER be published as "fallow"
+# (RUN-20261124-130006 published all 291 Tamil Nadu tehsils as fallow because every TREND/MAPS batch had failed).
+_want = {c_ for b_ in _batches for c_ in b_}
+_crop_teh = {c_ for c_ in _want if (SAT_CUR.get(c_, {}).get('crop_share') or 0) > 0.001}     # tehsils that have cropland
+_ok = {
+    'monthly': {c_ for c_ in _want if c_ in SAT_MONTHLY},
+    'current': {c_ for c_ in _want if SAT_CUR.get(c_, {}).get('crop_share') is not None},
+    'maps':    {c_ for c_ in _crop_teh if SAT_MAPS.get(c_, {}).get('active_frac') is not None},
+    'trend':   {c_ for c_ in _crop_teh if any(SAT_TREND.get(c_, {}).get(f'NDVI_T{i:02d}') is not None for i in range(TREND_STEPS))},
+    'weather': {c_ for c_ in _want if c_ in SAT_WX},
+}
+_base = {'monthly': _want, 'current': _want, 'maps': _crop_teh, 'trend': _crop_teh, 'weather': _want}
+EXTRACT_COVERAGE = {k: len(v) / max(1, len(_base[k])) for k, v in _ok.items()}
+EXTRACT_GAPS = {k: sorted(_base[k] - v) for k, v in _ok.items()}
+print('📡 Extraction coverage: ' + ' · '.join(f'{k} {v:.0%}' for k, v in EXTRACT_COVERAGE.items()))
+_bad = [k for k in ('monthly', 'current', 'maps', 'trend') if EXTRACT_COVERAGE[k] < MIN_EXTRACT_COVERAGE]
+if _bad:
+    raise SystemExit(f'⛔ Earth Engine extraction incomplete for {_bad} (coverage below {MIN_EXTRACT_COVERAGE:.0%}; missing e.g. '
+                     f'{ {k: EXTRACT_GAPS[k][:5] for k in _bad} }). Nothing is written – see the "retry" / "gave up" lines above for '
+                     'the Earth Engine error, fix it and re-run (completed batches are cached).')
 
 
 # ===== CELL 7b: IFPRI SPAM 2020 crop mix (auto-download, cached in Drive) =====
@@ -1828,7 +1853,11 @@ def crops_v3(r, geo_ha, cl_ha, mp, cur_share):
             alts=(f'Prior candidates – {cand_src}, NOT current evidence: ' + ', '.join(f'{n} {v / c_tot:.0%}' for n, v in cands))
                  if cands else 'No crop-statistics prior available',
             ev=f'{unknown:,.0f} ha active cropland not attributed to any crop' + wc_note))
-    if not out:
+    if not out and f('active_frac') is None:          # v4.2: crop-map extraction missing ≠ fallow
+        out.append(dict(crop='Satellite crop layers missing – not assessed', group='—', model=None, trend=None, area=0.0,
+            src='Satellite (current season)', presence='Insufficient data',
+            method='Earth Engine crop-map / trend reduction returned no data for this tehsil – re-run extraction', alts='—', ev='—'))
+    elif not out:
         out.append(dict(crop='Fallow – no active crop' if cur_share >= 0.2 else 'No clear observation this season', group='—',
             model=None, trend=None, area=0.0, src='Satellite (current season)',
             presence='No active crop detected' if cur_share >= 0.2 else 'Insufficient data',
@@ -2699,7 +2728,9 @@ if CAL is not None:
         harvest_w = (w[0] + dt.timedelta(days=dmin), w[1] + dt.timedelta(days=dmax)) if (w and dmin and dmax) else None
         rice = model == 'RICE'
         if rice:                       # TNAU rice months = nursery sowing; transplanting 18-40 d later (REFS TNAU_RICE_NURSERY)
-            tw = (w[0] + dt.timedelta(days=18), w[1] + dt.timedelta(days=40)) if w else None
+            # v4.2: seedling age by duration class (TNAU: short 18-22 d, medium 25-30 d, long 35-40 d) instead of 18-40 d for all
+            nur = (18, 22) if (dmax or 0) <= 120 else ((25, 30) if (dmax or 0) <= 140 else (35, 40))
+            tw = (w[0] + dt.timedelta(days=nur[0]), w[1] + dt.timedelta(days=nur[1])) if w else None
         # status today
         if not w:
             status = 'Off-season'
@@ -2741,7 +2772,7 @@ if CAL is not None:
         exp_stage = ''
         if table and w and base and base[0] <= TODAY:
             names = []
-            for S_ in (base[0], base[1]):
+            for S_ in (base[1], base[0]):            # v4.2: latest sowing first → stages listed early … late
                 if S_ <= TODAY:
                     names.append(table[max(0, min(len(table) - 1, sum(1 for n, d_, bk in table
                                   if (TODAY - S_).days >= ((d_[0] + d_[1]) / 2 if isinstance(d_, tuple) else d_)) - 1))][0])
@@ -2753,6 +2784,9 @@ if CAL is not None:
                 qc.append(f'calendar inherited from parent district {inherited[dk].title()} (district created after the source table)')
             if cr.source_confidence != 'High':
                 qc.append(f'source confidence {cr.source_confidence}: {cr.note}')
+            if rice and tw:
+                qc.append(f'rice: Ideal Sowing Window = NURSERY sowing (TNAU); the "Sowing" stage columns = TRANSPLANTING '
+                          f'(nursery + {nur[0]}-{nur[1]} d seedling age)')
             # ---- observed (current season) for this district × crop × season
             obs = [o for k_, o in enumerate(OBS_TEH) if o['dlgd'] == dr.dlgd and OBS_ROW.get(k_) == i_cal]
             o_area = round(sum(o['area'] for o in obs), 1) if obs else ''
