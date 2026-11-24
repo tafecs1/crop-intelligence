@@ -1,6 +1,6 @@
 # CropIntel – All-India tehsil crop intelligence
 
-Weekly GitHub Actions run of CropIntel v3.5 that writes 8 tabs to a Google Sheet:
+Weekly GitHub Actions run of CropIntel v4.0 that writes 8 tabs to a Google Sheet:
 `Crop_Intelligence_Current`, `NDVI_MoM`, `EVI_MoM`, `NDWI_MoM`, `NDRE_MoM`, `SAVI_MoM`, `BSI_MoM`, `Ideal_Crop_Window`.
 An Excel copy (plus Area_Balance, Data_Sources, References, Validation) is attached to every run as an artifact.
 
@@ -22,8 +22,9 @@ Schedule: every Monday 02:00 IST. Manual run: Actions → CropIntel weekly → R
 Share the Google Sheet with the service-account e-mail as **Editor**.
 
 ## Optional inputs
-Crop names for crops satellites cannot separate come automatically from CROPGRIDS 2020 (CC BY 4.0, downloaded on the first run and cached).
-Stages that satellite evidence cannot confirm are published as "(calendar estimate)" with a low confidence (QC17).
+v4.0: every stage is satellite-observed, model-inferred from an OBSERVED planting date, field-verified, or an explicit
+"Stage unresolved – …" status with its reason and next action. Crop statistics (CROPGRIDS 2020, optional SPAM / APY) are only listed as
+candidates. Tests: `pytest -q tests` (also run by the workflow before extraction). Details: `docs/CORRECTION_REPORT.md`.
 Optional extras: see `data/README.md` (Govt APY file, field observations, SPAM 2020).
 
 ## Join key for dashboards

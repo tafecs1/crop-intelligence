@@ -63,14 +63,14 @@ GGCMI_WINDOW_DAYS = 30                      # ± days around the GGCMI (multi-ye
 # v3.5: CROPGRIDS 2020 (Tang et al. 2024, Scientific Data, CC BY 4.0) – 173 crops at 0.05° (~5.6 km); per-crop NetCDF files download
 #       automatically (no form, no login). Used to NAME the crops satellites cannot separate (replaces the manual APY/SPAM step).
 USE_CROPGRIDS   = True
+S1_SPECKLE_PX   = 1                         # v4.0: focal-median radius in pixels (1 = 3×3) applied to every Sentinel-1 scene; 0 = off
+RICE_WATER_CHECK = True                     # v4.0: paddy pixels must also be seen as open water / flooded vegetation by Dynamic World or
+                                            #       Sentinel-2 MNDWI at least once in the flooding period (removes rain-wetted black soil)
+STALE_DAYS      = 20                        # v4.0: optical evidence older than this is "stale" – a stage cannot be called satellite-confirmed
 CROPGRIDS_DIR   = f'{DRIVE_DIR}/cropgrids'
 CROPGRIDS_URLS  = ['https://geodata.ucdavis.edu/geodata/crops/cropgrids/CROPGRIDSv1.07_{c}.nc']   # per-crop files (UC Davis mirror)
 CROPGRIDS_ZIP   = 'https://ndownloader.figshare.com/files/44950942'   # fallback: official figshare v1.08 zip (807 MB, all crops)
-OTHER_CURVE_SHARE = 0.60                    # a modelled crop that is ≥ this share of the tehsil's modelled seasonal crop area may use the
-                                            # measured curve of the remaining annual cropland (not rice / maize / winter cereal / perennial)
-CALENDAR_ESTIMATE = True                    # Option A: when evidence cannot confirm a stage, publish the crop-calendar stage labelled
-                                            # "(calendar estimate)" with a low confidence instead of "Stage not determined"
-STRICT_FILL     = True                      # stop the run (instead of writing placeholders) if no crop-mix source could be loaded
+STRICT_FILL     = False                     # v4.0: crop-mix priors are optional evidence; True = stop if none could be loaded
 # Official reference areas used ONLY to validate (never to set) satellite estimates. Add rows as figures are published.
 REFERENCE_AREAS = [
     dict(scope='Tamil Nadu (state)', state='Tamil Nadu', district=None, crop='Rice', what='2026-27 paddy area target, all seasons', ha=2_000_000, kind='upper_bound',
@@ -79,7 +79,7 @@ REFERENCE_AREAS = [
          date='2026-11-14', source='newkerala.com, 14-Nov-2026 – also reports crops "planted about a month ago"'),
 ]
 FIELD_OBS_CSV    = f'{INPUT_DIR}/field_observations.csv'  # OPTIONAL ground truth: tehsil_lgd,crop,stage,observation_date,planting_date
-MODEL_VERSION   = 'CropIntel-v3.5'
+MODEL_VERSION   = 'CropIntel-v4.0'
 RUN_DATE        = os.environ.get('RUN_DATE') or None   # set once per workflow run so all jobs share the same date
 
 
@@ -286,6 +286,8 @@ REFS = {
                  'harvested area circa 2020 at 0.05°, CC BY 4.0 (modelled from FAOSTAT 2020 + sub-national statistics + 27 gridded datasets)',
     'INDIA_CAL': 'Broad all-India sowing windows of the kharif / rabi / summer seasons (DES Agricultural Statistics at a Glance, crop calendar of '
                  'major crops; ICAR package of practices). Used ONLY when no TNAU or GGCMI window exists for the tehsil',
+    'MACHINERY': 'TNAU Agritech Portal – Agricultural Engineering (farm machinery by crop & operation), agritech.tnau.ac.in; '
+                 'ICAR-CIAE Bhopal crop-wise mechanisation packages',
     'SPAM': 'IFPRI SPAM 2020 V2r2 harvested area, 5-arcmin (~10 km) modelled crop allocation, doi:10.7910/DVN/SWPENT',
     'ERA5': 'ECMWF ERA5-Land daily aggregates (ECMWF/ERA5_LAND/DAILY_AGGR), 11.1 km, reanalysis',
     'CHIRPS': 'UCSB-CHG CHIRPS daily rainfall, ~5.5 km',
@@ -446,6 +448,77 @@ INDIA_WINDOWS = {
 }
 MACHINERY_BY_BUCKET = {'Land Prep': 'Tillage', 'Sowing': 'Seeding / transplanting', 'Germination': 'None',
                        'Vegetative': 'Spraying', 'Flowering': 'Spraying', 'Grain Fill/Maturity': 'None', 'Harvest': 'Harvesting'}
+# v4.0 operation → machinery engine (crop family × stage bucket of the NEXT stage). Equipment classes as listed by the TNAU Agritech
+# Portal (Agricultural Engineering – farm machinery) and ICAR-CIAE crop-wise mechanisation packages; '' = no machine operation.
+CROP_FAMILY = {'RICE': 'rice', 'RICE_RECENT': 'rice', 'RICE_HARVESTED': 'rice', 'Maize': 'maize', 'Wheat': 'wheat',
+               'Groundnut': 'groundnut', 'Cotton': 'cotton', 'Black gram': 'pulses', 'Green gram': 'pulses', 'Chickpea': 'pulses',
+               'Rapeseed & Mustard': 'mustard', 'Sugarcane': 'sugarcane'}
+MACHINERY = {
+    ('rice', 'Land Prep'): ('Land preparation – puddling', 'Tractor / power tiller with cage wheel + rotavator or puddler'),
+    ('rice', 'Sowing'): ('Transplanting', 'Paddy transplanter (walk-behind or riding) with mat nursery; drum seeder for wet direct seeding'),
+    ('rice', 'Germination'): ('Gap filling / water management', ''),
+    ('rice', 'Vegetative'): ('Weed control + top dressing', 'Cono-weeder / rotary weeder; knapsack or power sprayer if herbicide used'),
+    ('rice', 'Flowering'): ('Crop protection (pests / diseases at booting–heading)', 'Knapsack / power sprayer or drone sprayer'),
+    ('rice', 'Grain Fill/Maturity'): ('Drain field before harvest', ''),
+    ('rice', 'Harvest'): ('Harvesting + threshing', 'Track-type combine harvester (wet fields) or reaper + paddy thresher'),
+    ('maize', 'Land Prep'): ('Land preparation', 'Disc / mouldboard plough + cultivator or rotavator; ridger for ridges & furrows'),
+    ('maize', 'Sowing'): ('Sowing', 'Seed drill / pneumatic maize planter'),
+    ('maize', 'Germination'): ('Gap filling', ''),
+    ('maize', 'Vegetative'): ('Weeding / earthing up', 'Power weeder or tractor-drawn intercultivator; sprayer (fall armyworm)'),
+    ('maize', 'Flowering'): ('Crop protection', 'Knapsack / power sprayer'),
+    ('maize', 'Grain Fill/Maturity'): ('Monitoring', ''),
+    ('maize', 'Harvest'): ('Harvesting + shelling', 'Maize combine / cob picker, then maize sheller'),
+    ('wheat', 'Land Prep'): ('Land preparation', 'Plough + cultivator / rotavator (or none for zero-till)'),
+    ('wheat', 'Sowing'): ('Sowing', 'Seed-cum-fertilizer drill / zero-till drill / happy seeder'),
+    ('wheat', 'Germination'): ('First irrigation (CRI)', ''),
+    ('wheat', 'Vegetative'): ('Weed control', 'Boom / knapsack sprayer'),
+    ('wheat', 'Flowering'): ('Crop protection', 'Knapsack / power sprayer'),
+    ('wheat', 'Grain Fill/Maturity'): ('Monitoring', ''),
+    ('wheat', 'Harvest'): ('Harvesting + threshing', 'Combine harvester or reaper-binder + thresher'),
+    ('groundnut', 'Land Prep'): ('Land preparation', 'Plough + cultivator / rotavator; bed former'),
+    ('groundnut', 'Sowing'): ('Sowing', 'Groundnut seed drill / planter'),
+    ('groundnut', 'Germination'): ('Gap filling', ''),
+    ('groundnut', 'Vegetative'): ('Weeding', 'Power weeder / intercultivator'),
+    ('groundnut', 'Flowering'): ('Gypsum application at pegging, earthing up; crop protection', 'Intercultivator; knapsack sprayer'),
+    ('groundnut', 'Grain Fill/Maturity'): ('Monitoring', ''),
+    ('groundnut', 'Harvest'): ('Lifting + stripping + threshing', 'Groundnut digger / lifter, pod stripper, groundnut thresher'),
+    ('cotton', 'Land Prep'): ('Land preparation', 'Plough + cultivator; ridger'),
+    ('cotton', 'Sowing'): ('Sowing', 'Planter / seed drill (dibbling common)'),
+    ('cotton', 'Germination'): ('Gap filling / thinning', ''),
+    ('cotton', 'Vegetative'): ('Weeding + crop protection', 'Power weeder / intercultivator; sprayer'),
+    ('cotton', 'Flowering'): ('Crop protection (bollworms, sucking pests)', 'Knapsack / power sprayer'),
+    ('cotton', 'Grain Fill/Maturity'): ('Crop protection', 'Knapsack / power sprayer'),
+    ('cotton', 'Harvest'): ('Picking', 'Manual picking (machine pickers not common in Tamil Nadu); stalk shredder after picking'),
+    ('pulses', 'Land Prep'): ('Land preparation', 'Cultivator / rotavator'),
+    ('pulses', 'Sowing'): ('Sowing', 'Seed drill (rice-fallow pulses: broadcast in standing rice)'),
+    ('pulses', 'Germination'): ('Gap filling', ''),
+    ('pulses', 'Vegetative'): ('Weeding', 'Power weeder / intercultivator'),
+    ('pulses', 'Flowering'): ('Crop protection / foliar spray', 'Knapsack sprayer'),
+    ('pulses', 'Grain Fill/Maturity'): ('Monitoring', ''),
+    ('pulses', 'Harvest'): ('Harvesting + threshing', 'Manual / reaper, multi-crop thresher'),
+    ('mustard', 'Land Prep'): ('Land preparation', 'Cultivator / rotavator'),
+    ('mustard', 'Sowing'): ('Sowing', 'Seed drill'),
+    ('mustard', 'Germination'): ('Thinning', ''),
+    ('mustard', 'Vegetative'): ('Weeding / irrigation', 'Intercultivator'),
+    ('mustard', 'Flowering'): ('Crop protection (aphids)', 'Knapsack sprayer'),
+    ('mustard', 'Grain Fill/Maturity'): ('Monitoring', ''),
+    ('mustard', 'Harvest'): ('Harvesting + threshing', 'Reaper / manual, multi-crop thresher'),
+    ('sugarcane', 'Land Prep'): ('Land preparation', 'Deep tillage (chisel / disc plough) + ridger / furrower'),
+    ('sugarcane', 'Sowing'): ('Planting', 'Sugarcane sett-cutter planter or single-bud chip transplanting'),
+    ('sugarcane', 'Germination'): ('Gap filling', ''),
+    ('sugarcane', 'Vegetative'): ('Earthing up, trash management', 'Power weeder / intercultivator; tractor earthing-up unit'),
+    ('sugarcane', 'Grain Fill/Maturity'): ('Monitoring / maturity testing', ''),
+    ('sugarcane', 'Harvest'): ('Harvesting', 'Sugarcane harvester (chopper) or manual cutting; trash shredder for ratoon'),
+}
+REFS_MACHINERY = 'MACHINERY'
+
+def machinery_for(model, bucket):
+    fam = CROP_FAMILY.get(model)
+    if not fam or not bucket:
+        return 'None', '', ''
+    op, eq = MACHINERY.get((fam, bucket), ('', ''))
+    cat = MACHINERY_BY_BUCKET.get(bucket, 'None') if eq else 'None'
+    return cat, op, eq
 
 def month_window_dates(months, ref):
     """Most recent occurrence (start, end) of a sowing-month window at or before ref (+30 d look-ahead)."""
@@ -486,7 +559,10 @@ WC_MAIZE  = WC_MZ_R if SEASON == 'Rabi' else WC_MZ_K
 def _mask_s2(img):
     scl = img.select('SCL')
     good = scl.eq(4).Or(scl.eq(5)).Or(scl.eq(6)).Or(scl.eq(7))
-    return img.select(S2_BANDS).updateMask(good).divide(10000).toFloat()
+    # v4.0 FIX: keep the acquisition time – without copyProperties every masked image lost 'system:time_start', so the
+    #           "last clear S2" date fell back to 0 ms = 1970-01-01 in every row of v3.x
+    return ee.Image(img.select(S2_BANDS).updateMask(good).divide(10000).toFloat()
+                    .copyProperties(img, ['system:time_start', 'system:index', 'CLOUDY_PIXEL_PERCENTAGE', 'SPACECRAFT_NAME']))
 
 def s2_collection(start, end, region):
     return (ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED').filterBounds(region)
@@ -509,14 +585,22 @@ def s2_composite(start, end, region, bands, suffix):
     valid = idx.select(bands[0]).mask().gt(0).toFloat().rename('valid').updateMask(CROPLAND)
     return ee.Image.cat([idx, valid]).rename([f'{b}_{suffix}' for b in bands] + [f'valid_{suffix}'])
 
-def s1_collection(start, end, region, pols=('VV', 'VH')):
+def s1_collection(start, end, region, pols=('VV', 'VH'), single_pass=False):
     col = (ee.ImageCollection('COPERNICUS/S1_GRD').filterBounds(region).filterDate(str(start), str(end))
            .filter(ee.Filter.eq('instrumentMode', 'IW')))
     for p in pols:
         col = col.filter(ee.Filter.listContains('transmitterReceiverPolarisation', p))
-    return col.select(list(pols))
+    if single_pass:      # v4.0: backscatter curves use ONE orbit direction (asc/desc geometry differs by 1-2 dB) – the pass with more scenes
+        asc = col.filter(ee.Filter.eq('orbitProperties_pass', 'ASCENDING'))
+        des = col.filter(ee.Filter.eq('orbitProperties_pass', 'DESCENDING'))
+        col = ee.ImageCollection(ee.Algorithms.If(asc.size().gte(des.size()), asc, des))
+    col = col.select(list(pols))
+    if S1_SPECKLE_PX:    # v4.0: 3×3 focal median speckle filter (dB), acquisition time kept
+        col = col.map(lambda i: ee.Image(i.focalMedian(S1_SPECKLE_PX, 'square', 'pixels').rename(list(pols))
+                                         .copyProperties(i, ['system:time_start', 'orbitProperties_pass'])))
+    return col
 
-def rice_layers(region, vh_th=None, vv_th=None, drop_db=None, rise_db=None, core_only=False):
+def rice_layers(region, vh_th=None, vv_th=None, drop_db=None, rise_db=None, core_only=False, water_check=None):
     """v3.1 paddy rule, per pixel, Sentinel-1 VV+VH, CURRENT SEASON ONLY:
     1) flooded acquisition = VH < RICE_VH_FLOOD_DB AND VV < RICE_VV_FLOOD_DB, on/after RICE_FLOOD_START;
     2) planting = START of the LATEST flooding episode (first flooded acquisition after the last non-flooded one). Standing water
@@ -547,10 +631,26 @@ def rice_layers(region, vh_th=None, vv_th=None, drop_db=None, rise_db=None, core
     prior_max = col.map(lambda i: i.updateMask(i.select('t').lt(ft.subtract(5)).And(i.select('t').gte(ft.subtract(45))))).select('VH').max()
     rise = col.map(lambda i: i.updateMask(i.select('t').gte(ft.add(14)))).select('VH').max().subtract(fvh)
     base = prior_max.subtract(fvh).gte(drop_db).And(CROPLAND).And(WATER.Not())
+    water_check = RICE_WATER_CHECK if water_check is None else water_check
+    if water_check:
+        # v4.0 independent optical check: a paddy pixel must ALSO be seen as open water / flooded vegetation at least once in the
+        # flooding period – Dynamic World (water or flooded-vegetation probability ≥ 0.3) OR Sentinel-2 MNDWI ≥ 0. Rain-wetted
+        # black (vertisol) soil darkens radar like puddling but is rarely seen as open water optically (Tuticorin / Virudhunagar
+        # false paddy in v3.5). Cloud-free evidence is required, so this can only REMOVE pixels, never add them.
+        dwp = (DW.filterBounds(region).filterDate(str(RICE_FLOOD_START), str(TODAY + dt.timedelta(days=1)))
+               .map(lambda i: i.select('water').add(i.select('flooded_vegetation')).rename('w'))
+               .merge(ee.ImageCollection([EMPTY_1('w')])).max())
+        mndwi = (s2_collection(RICE_FLOOD_START, TODAY + dt.timedelta(days=1), region)
+                 .map(lambda i: i.normalizedDifference(['B3', 'B11']).rename('m')).merge(ee.ImageCollection([EMPTY_1('m')])).max())
+        base = base.And(dwp.gte(0.3).Or(mndwi.gte(0.0)).unmask(0))
     est_all = base.And(rise.gte(rise_db)).unmask(0)
     if core_only:                                            # calibration: paddy this season (standing + harvested) + recently flooded
         return est_all.Or(base.And(ft.gte(fe - RICE_RECENT_DAYS)).unmask(0))
     recent = base.And(ft.gte(fe - RICE_RECENT_DAYS)).And(rise.lt(rise_db).unmask(1)).unmask(0).And(est_all.Not())
+    # v4.0: flooded 'RICE_RECENT_DAYS'-75 d ago, drop test passed, but no canopy rise yet → reported separately as a CANDIDATE
+    #       (possible late-transplanted paddy under deep water, or waterlogging) – never counted as rice
+    pend = (base.And(ft.lt(fe - RICE_RECENT_DAYS)).And(ft.gte(fe - 75)).And(rise.lt(rise_db).unmask(1)).unmask(0)
+            .And(est_all.Not()).And(recent.Not()))
     # harvested this season: paddy cycle ≥ 80 d old AND max NDVI in the last 30 d below RICE_HARVEST_NDVI (cloud-masked → treated as standing)
     nd30 = (s2_collection(TODAY - dt.timedelta(days=30), TODAY + dt.timedelta(days=1), region)
             .map(lambda i: i.normalizedDifference(['B8', 'B4']).rename('NDVI')).max())
@@ -562,7 +662,7 @@ def rice_layers(region, vh_th=None, vv_th=None, drop_db=None, rise_db=None, core
     v30 = (lo30.select('VH').lt(-18).And(hi30.select('VH').subtract(lo30.select('VH')).gte(3)).And(hi30.select('t').gt(lo30.select('t')))
            .And(CROPLAND).And(WATER.Not())).unmask(0)
     bins = [est.And(ft.gte(a)).And(ft.lt(b)).unmask(0) for a, b in RICE_BINS]
-    return dict(est=est, recent=recent, harv=harv, ft=ft.updateMask(est), ft_recent=ft.updateMask(recent), ft_harv=ft.updateMask(harv),
+    return dict(est=est, recent=recent, harv=harv, pend=pend, ft=ft.updateMask(est), ft_recent=ft.updateMask(recent), ft_harv=ft.updateMask(harv),
                 obs=col.select('VH').count().toFloat(), v30=v30, bins=bins)
 
 IDX6 = ['NDVI', 'EVI', 'NDWI', 'NDRE', 'SAVI', 'BSI']
@@ -586,7 +686,7 @@ def trend_image(region):
     oth = (ndmax.gte(0.35).unmask(0).And(CROPLAND).And(rice.Not()).And(R['recent'].Not()).And(R['harv'].Not())
            .And(mz.Not()).And(wcm.Not()).And(perennial.Not()))
     masks = {'': None, 'RICE': rice, 'MZ': mz, 'WC': wcm, 'OTH': oth}
-    s1 = s1_collection(TREND_ENDS[0] - dt.timedelta(days=14), TODAY + dt.timedelta(days=1), region, ('VH',))
+    s1 = s1_collection(TREND_ENDS[0] - dt.timedelta(days=14), TODAY + dt.timedelta(days=1), region, ('VH',), single_pass=True)
     bands = []
     for i, e in enumerate(TREND_ENDS):
         a, b = e - dt.timedelta(days=14), e + dt.timedelta(days=1)
@@ -630,9 +730,11 @@ def maps_image(region):
     cohorts = [b.toFloat().rename(f'rice_coh_{k:02d}') for k, b in enumerate(R['bins'])]
     if RICE_CALIBRATE:
         cohorts += [rice_layers(region, *cs, core_only=True).toFloat().rename(f'rice_cal_{k}') for k, cs in enumerate(RICE_CAL_SETS)]
+        cohorts += [rice_layers(region, *cs, core_only=True, water_check=False).toFloat().rename(f'rice_calnw_{k}')
+                    for k, cs in enumerate(RICE_CAL_SETS)]
     return ee.Image.cat([
         rice.toFloat().rename('rice_frac'), recent.toFloat().rename('rice_recent_frac'), R['v30'].toFloat().rename('rice_frac_v30'),
-        R['harv'].toFloat().rename('rice_harv_frac'), R['ft_harv'].rename('rice_harv_t'),
+        R['harv'].toFloat().rename('rice_harv_frac'), R['ft_harv'].rename('rice_harv_t'), R['pend'].toFloat().rename('rice_pend_frac'),
         R['ft'].rename('rice_flood_t'), R['ft_recent'].rename('rice_recent_t'), R['obs'].updateMask(rice).rename('rice_s1_obs'),
         rice.And(dw_crop).unmask(0).toFloat().rename('rice_dw_frac'), mz.And(dw_crop).unmask(0).toFloat().rename('mz_dw_frac'),
         WC_WINTER.toFloat().rename('wc_frac'), wcl.toFloat().rename('wc_active_frac'), WC_CONF.rename('wc_conf'),
@@ -668,7 +770,7 @@ def current_image(region):
     start, end = TODAY - dt.timedelta(days=30), TODAY + dt.timedelta(days=1)
     cur = s2_composite(start, end, region, ['NDVI', 'EVI', 'NDRE', 'NDMI', 'NDWI', 'BSI'], 'CUR')
     s2n = s2_collection(start, end, region).select('B4').count().toFloat().rename('s2_scenes').updateMask(CROPLAND)
-    s1c = s1_collection(start, end, region).merge(ee.ImageCollection(
+    s1c = s1_collection(start, end, region, single_pass=True).merge(ee.ImageCollection(
         [ee.Image.constant([0, 0]).rename(['VV', 'VH']).toFloat().updateMask(ee.Image.constant(0))]))
     s1 = s1c.map(lambda i: ee.Image(10).pow(i.divide(10)).copyProperties(i)).mean().log10().multiply(10).updateMask(CROPLAND)  # linear mean → dB
     s1n = s1c.select('VV').count().toFloat().rename('s1_scenes').updateMask(CROPLAND)
@@ -860,11 +962,28 @@ os.makedirs(CACHE_DIR, exist_ok=True)
 def _cache_path(kind, codes):
     return f"{CACHE_DIR}/{kind}_{hashlib.md5(json.dumps(sorted(map(str, codes))).encode()).hexdigest()[:12]}.json"
 
-def reduce_batch(img, fc_b, scale=None):
-    out = img.reduceRegions(collection=fc_b, reducer=ee.Reducer.mean(), scale=scale or SCALE_M, tileScale=8)
+def obs_image(region):
+    """v4.0 actual acquisition dates. Per pixel: day offset (from TODAY-60) of the latest Sentinel-2 scene with a CLEAR (unmasked)
+    observation, and of the latest Sentinel-1 scene. Reduced per tehsil with max (= the latest acquisition date that saw any cropland
+    pixel – an actual scene date) and median (the typical latest clear date over the cropland)."""
+    start, end = TODAY - dt.timedelta(days=60), TODAY + dt.timedelta(days=1)
+    d0 = ee.Date(str(start))
+    def day(i, band, name):
+        return (ee.Image.constant(i.date().difference(d0, 'day').floor()).toFloat().rename(name).updateMask(i.select(band).mask()))
+    s2 = (ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED').filterBounds(region).filterDate(str(start), str(end))
+          .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 85)).map(_mask_s2).map(lambda i: day(i, 'B4', 's2_day'))
+          .merge(ee.ImageCollection([EMPTY_1('s2_day')])).max().updateMask(CROPLAND))
+    s1 = (s1_collection(start, end, region, ('VV',)).map(lambda i: day(i, 'VV', 's1_day'))
+          .merge(ee.ImageCollection([EMPTY_1('s1_day')])).max().updateMask(CROPLAND))
+    return ee.Image.cat([s2, s1])
+
+OBS_REDUCER = ee.Reducer.max().combine(ee.Reducer.median(), sharedInputs=True)
+
+def reduce_batch(img, fc_b, scale=None, reducer=None):
+    out = img.reduceRegions(collection=fc_b, reducer=reducer or ee.Reducer.mean(), scale=scale or SCALE_M, tileScale=8)
     return [x['properties'] for x in out.map(lambda f: ee.Feature(None, f.toDictionary())).getInfo()['features']]
 
-def safe_reduce(kind, codes, img_fn, add_area=False, scale=None):
+def safe_reduce(kind, codes, img_fn, add_area=False, scale=None, reducer=None):
     p = _cache_path(kind, codes)
     if os.path.exists(p):
         return json.load(open(p))
@@ -874,7 +993,7 @@ def safe_reduce(kind, codes, img_fn, add_area=False, scale=None):
                 fc_b = fc_for(cs)
                 if add_area:
                     fc_b = fc_b.map(lambda f: f.set('area_ha', f.geometry().area(100).divide(1e4)))
-                return reduce_batch(img_fn(fc_b), fc_b, scale)
+                return reduce_batch(img_fn(fc_b), fc_b, scale, reducer)
             except ee.EEException as e:
                 msg = str(e).lower()
                 if any(s in msg for s in ['memory', 'timed out', 'too large', 'limit exceeded']) and len(cs) > 3 and depth < 6:
@@ -891,7 +1010,8 @@ def safe_reduce(kind, codes, img_fn, add_area=False, scale=None):
 
 SAT_MONTHLY, SAT_TREND, SAT_CUR, SAT_MAPS, SAT_WX = {}, {}, {}, {}, {}
 RICE_SIG = hashlib.md5(json.dumps([RICE_VH_FLOOD_DB, RICE_VV_FLOOD_DB, RICE_VH_DROP_DB, RICE_VH_RISE_DB, RICE_FLOOD_LEAD_DAYS,
-                                   RICE_RECENT_DAYS, RICE_HARVEST_NDVI, RICE_CALIBRATE, RICE_CAL_SETS]).encode()).hexdigest()[:8]
+                                   RICE_RECENT_DAYS, RICE_HARVEST_NDVI, RICE_CALIBRATE, RICE_CAL_SETS, S1_SPECKLE_PX,
+                                   RICE_WATER_CHECK, 'v4.0']).encode()).hexdigest()[:8]
 GEO_AREA_HA = dict(zip(TEH.lgd, (gpd.GeoSeries(TEH.geometry, crs=4326).to_crs(6933).area / 1e4).round(1)))  # full-res, equal-area
 # GitHub: batches are built per state, so a shard job and the final job create identical batches (= identical cache files)
 SHARD_COUNT, SHARD_INDEX = int(os.environ.get('SHARD_COUNT', '1')), int(os.environ.get('SHARD_INDEX', '0'))
@@ -913,8 +1033,10 @@ for bi, codes in enumerate(_batches, 1):
             SAT_MONTHLY.setdefault(norm_code(pr.get(LGD_F)), {}).update(pr)
     for pr in safe_reduce(f'TREND6_{TODAY}_{RICE_SIG}', codes, trend_image):
         SAT_TREND[norm_code(pr.get(LGD_F))] = pr
-    for pr in safe_reduce(f'CUR4_{TODAY}', codes, current_image, add_area=True):
+    for pr in safe_reduce(f'CUR5_{TODAY}', codes, current_image, add_area=True):
         SAT_CUR[norm_code(pr.get(LGD_F))] = pr
+    for pr in safe_reduce(f'OBS1_{TODAY}', codes, obs_image, reducer=OBS_REDUCER, scale=max(SCALE_M, 60)):
+        SAT_CUR.setdefault(norm_code(pr.get(LGD_F)), {}).update({k: v for k, v in pr.items() if k.startswith(('s2_day', 's1_day'))})
     for pr in safe_reduce(f'MAPS5_{TODAY}_{RICE_SIG}', codes, maps_image):
         SAT_MAPS[norm_code(pr.get(LGD_F))] = pr
     for pr in safe_reduce(f'WX_{TODAY}', codes, weather_image, scale=11132):
@@ -1495,7 +1617,36 @@ def history_windows(lgd, season):
 print('✅ Phenology engine ready')
 
 
-# ===== CELL 10: Tab 1 – Crop_Intelligence_Current (57 cols)  +  Tab 8 – Ideal_Crop_Window (52 cols) =====
+# ===== CELL 10: Tab 1 – Crop_Intelligence_Current (57 + 13 cols)  +  Tab 8 – Ideal_Crop_Window (52 + 4 cols) =====
+# ---- v4.0 crop phenology database: ONE table built from the sourced stage models used by the engine (no new, unsourced crops)
+BOTANICAL = {'RICE': 'Oryza sativa', 'Maize': 'Zea mays', 'Groundnut': 'Arachis hypogaea', 'Cotton': 'Gossypium spp.',
+             'Black gram': 'Vigna mungo', 'Green gram': 'Vigna radiata', 'Sugarcane': 'Saccharum officinarum',
+             'Wheat': 'Triticum aestivum', 'Rapeseed & Mustard': 'Brassica juncea / B. napus', 'Chickpea': 'Cicer arietinum'}
+def _pheno_rows():
+    rows = []
+    _rt = rice_stage_table(RICE_MODEL_DB_F) if 'RICE_MODEL_DB_F' in globals() else rice_stage_table(110)
+    tables = [('RICE', 'Rice (paddy)', 'Cereals', 'Annual (transplanted)', [(n, (d, d), bk, al) for n, d, bk, al in _rt],
+               'TNAU_RICE_SEASONS / RICE_PHASES / RICE_MILK_DOUGH (field duration F = 110 d shown; the engine scales by TNAU duration class)')]
+    tables += [(m, m, d['group'], 'Perennial (ratoon)' if m == 'Sugarcane' else 'Annual', d['stages'], d['ref']) for m, d in CROP_MODELS.items()]
+    for cid, name, grp, ctype, tab, ref in tables:
+        for k, (stg, st, bk, allowed) in enumerate(tab):
+            lo, hi = (st if isinstance(st, tuple) else (st, st))
+            rows.append(dict(crop_id=cid, crop_name=name, crop_group=grp, botanical_name=BOTANICAL.get(cid, ''), crop_type=ctype,
+                growth_stage_code=f"{cid.upper().replace(' ', '')[:6]}-S{k + 1:02d}", growth_stage_name=stg, stage_order=k + 1,
+                stage_bucket=bk, stage_start_days_min=lo, stage_start_days_max=hi,
+                day_reference='days after transplanting' if cid == 'RICE' else 'days after sowing / planting',
+                relevant_satellite_signals='S2 NDVI/EVI curve' + (' + S1 VH' if cid == 'RICE' else ''),
+                expected_vegetation_pattern=', '.join(PHASES[a_] for a_ in sorted(allowed)),
+                local_season='TNAU calendar (Tamil Nadu); GGCMI / national windows elsewhere', irrigation_type='as per calendar source',
+                applicable_agroclimatic_zone='Tamil Nadu (TNAU) – other states use GGCMI windows with the same durations',
+                source_reference=REFS.get(ref.split(' ')[0], ref), source_confidence='Published agronomic duration – not locally validated'))
+    for name in ['Coconut', 'Banana', 'Mango', 'Tea', 'Rubber', 'Pearl millet', 'Finger millet', 'Sorghum', 'Red gram (pigeonpea)']:
+        rows.append(dict(crop_id=name, crop_name=name, growth_stage_name='NOT SUPPORTED – no sourced stage model in this version',
+                         source_confidence='Unsupported – stage always reported as unresolved'))
+    return pd.DataFrame(rows)
+PHENO_DB = _pheno_rows()
+print(f'🌱 Crop phenology DB: {PHENO_DB.crop_id.nunique()} crops ({(PHENO_DB.stage_order.notna()).sum()} stage rows)')
+
 T1_HEADER = ['State', 'State LGD Code', 'District', 'District LGD Code', 'Tehsil', 'Tehsil LGD Code', 'Boundary Unit',
     'Crop', 'Crop Season', 'Crop Presence Status', 'Crop Identification Method', 'Crop Identification Confidence',
     'Estimated Crop Area Ha', 'Cropland Area Ha (WorldCover)', 'District Crop Area Ha (Govt/ISRO)', 'Crop Area Evidence',
@@ -1507,16 +1658,26 @@ T1_HEADER = ['State', 'State LGD Code', 'District', 'District LGD Code', 'Tehsil
     'NDVI Trend (14-day steps, oldest to latest)',
     'Rainfall mm', 'Rainfall Observation Period', 'Temperature',
     'Valid S2 Pixel Share', 'S2 Scenes / S1 Scenes', 'Field Verification Status', 'Geography Validation', 'Evidence Classification',
-    'QC Flags', 'Overall Confidence Score', 'Model Version', 'Source', 'Processing Date', 'Run ID']
+    'QC Flags', 'Overall Confidence Score', 'Model Version', 'Source', 'Processing Date', 'Run ID',
+    # v4.0 appended (the first 57 columns are unchanged so existing dashboards keep working)
+    'Crop Stage Start Estimate', 'Crop Stage End Estimate', 'Latest S2 Acquisition Date', 'Latest S1 Acquisition Date',
+    'Latest Usable Observation Date', 'Days Since Observation', 'Satellite Freshness', 'Stage Estimation Method',
+    'Stage Verification Status', 'Alternative Stage Candidates', 'Stage Unresolved Reason / Next Action', 'Alternative Crop Candidates',
+    'Crop Area Basis']
+AREA_BASIS = {'Perennial crops': 'Physical area of perennially green cropland (12 months) – not a seasonal sown area',
+              'Unidentified': 'Active cropland this season not attributed to a crop (physical area)',
+              'Candidate': 'Flooded cropland this season, crop not confirmed (physical area)',
+              '—': 'Not applicable'}
 T8_HEADER = ['State', 'State LGD Code', 'District', 'District LGD Code', 'Tehsil', 'Tehsil LGD Code', 'Crop', 'Crop Season',
     'Final Crop Stage (current)', 'Ideal Window Source', 'Ideal Window Confidence', 'Ideal Sowing Window', 'Ideal Harvest Window',
     'Ideal Crop Duration Days', 'Actual Sowing Date (this season)', 'Sowing Deviation Days (+ late / − early)',
     'Overall Timing Status (Early / On Time / Late)', 'Expected Harvest Date (adjusted)', 'Days to Harvest', 'Next Stage',
     'Next Stage Ideal Start', 'Machinery Need – Next Stage (Tillage / Seeding / Spraying / Harvesting / None)']
+T8_TAIL = ['Next Stage Operation', 'Machinery Recommendation (crop & operation)', 'Machinery Basis', 'Sowing Reference Basis']
 for st in STAGE_BUCKETS:
     T8_HEADER += [f'{st} – Ideal Start', f'{st} – Ideal End', f'{st} – Actual Start', f'{st} – Deviation Days']
-T8_HEADER += ['QC Flags', 'Run ID']
-assert len(T1_HEADER) == 57 and len(T8_HEADER) == 52, (len(T1_HEADER), len(T8_HEADER))
+T8_HEADER += ['QC Flags', 'Run ID'] + T8_TAIL
+assert len(T1_HEADER) == 57 + 13 and len(T8_HEADER) == 52 + 4, (len(T1_HEADER), len(T8_HEADER))
 
 ds = lambda d: d.isoformat() if isinstance(d, dt.date) else ''
 wtxt = lambda a, b: f'{a:%d-%b-%Y} to {b:%d-%b-%Y}' if (a and b) else NA
@@ -1585,7 +1746,7 @@ def crops_v3(r, geo_ha, cl_ha, mp, cur_share):
     harv_ha = (f('rice_harv_frac') or 0) * geo_ha
     if harv_ha >= 1:
         out.append(dict(crop='Rice (paddy)', group='Cereals', model='RICE_HARVESTED', trend=None, area=harv_ha,
-            src='Satellite (current season)', presence='High-confidence satellite identification',
+            src='Satellite (current season)', presence='Detected – current-season satellite evidence',
             method=rule + f'; ≥ {RICE_VH_RISE_DB:.0f} dB VH rise (crop grew), cycle ≥ 80 d old, and max Sentinel-2 NDVI in the last 30 d '
                    f'< {RICE_HARVEST_NDVI} → HARVESTED this season (the field may now be fallow or sown to the next crop)',
             alts='Crop failure / lodging (verify)', ev=f'{harv_ha:,.0f} ha of this season\'s paddy pixels now harvested'))
@@ -1605,8 +1766,13 @@ def crops_v3(r, geo_ha, cl_ha, mp, cur_share):
     wc_share = (f('wc_frac') or 0) * geo_ha / cl_ha if cl_ha else 0
     wc_spam = (SPAM_TEH.get(r.lgd) or {}).get('whea', 0) + (SPAM_TEH.get(r.lgd) or {}).get('barl', 0)
     _mix_tot = sum((SPAM_TEH.get(r.lgd) or {}).values())
+    _st_mix = STATE_SPAM.get(STATE_OF.get(r.lgd), {})
+    _st_wc = (_st_mix.get('whea', 0) + _st_mix.get('barl', 0)) / (sum(_st_mix.values()) or 1)
     wc_why = ('Govt APY reports wheat/barley in the district' if wc_govt > 0 else
-              f'{MIX_NAME} shows {wc_spam:,.0f} ha wheat/barley' if wc_spam >= max(100, 0.05 * _mix_tot) else None)
+              f'{MIX_NAME} shows {wc_spam:,.0f} ha wheat/barley' if (wc_spam >= max(100, 0.05 * _mix_tot) and _st_wc >= 0.01) else None)
+    if wc_why is None and wc_spam > 0 and _st_wc < 0.01:
+        wc_note = (f'; {MIX_NAME} lists {wc_spam:,.0f} ha wheat/barley here, but wheat/barley is < 1 % of the state crop mix – '
+                   'treated as a statistical artefact (no wheat row)')
     if wc_ha >= 1 and wc_why and SEASON == 'Rabi':
         out.append(dict(crop='Wheat (winter cereal – wheat/barley not separable by map)', group='Cereals', model='Wheat', trend='WC', area=wc_ha,
             src='Historical map (2021) + current activity', presence='Probable crop identification',
@@ -1616,80 +1782,59 @@ def crops_v3(r, geo_ha, cl_ha, mp, cur_share):
     elif wc_ha >= 1:
         wc_note = (f'; includes {wc_ha:,.0f} ha that the 2021 WorldCereal map labels winter cereals – NOT reported as wheat/barley: '
                    'no current-season or Govt evidence (old map ≠ current crop)')
-    if per_ha >= 1:
-        mix = mix_for(r)
-        perennial_alts = sorted([(SPAM_NAMES.get(k, k), v, k) for k, v in mix.items() if k in SPAM_SEASON['Annual']], key=lambda x: -x[1])[:5]
-        if perennial_alts:     # v3.5: named after the largest perennial crop of the crop mix; the satellite only proves "perennial"
-            p_name, p_ha, p_code = perennial_alts[0]
-            p_share = p_ha / sum(v for _, v, _ in perennial_alts)
-            out.append(dict(crop=p_name, group='Perennial crops', model=SPAM_TO_MODEL.get(p_code), trend=None, area=per_ha,
-                src='Satellite (12-month greenness)', presence='Probable crop identification', perennial=True,
-                method=(f'Cropland green (NDVI ≥ 0.4) in ≥ 85 % of clear months over 12 months (satellite: perennial / long-duration crop); '
-                        f'named {p_name} = largest perennial crop in the {MIX_NAME} crop mix ({p_share:.0%} of its perennial area) – '
-                        'the satellite cannot separate sugarcane, banana, coconut or orchards'),
-                alts=', '.join(f'{n} ({MIX_NAME} {v:,.0f} ha)' for n, v, _ in perennial_alts[1:]) or '—',
-                ev=f'{per_ha:,.0f} ha of perennially green cropland pixels'))
-        else:
-            out.append(dict(crop='Perennial / long-duration crops', group='Perennial crops', model=None, trend=None, area=per_ha,
-                src='Satellite (12-month greenness)', presence='Crop group identified, exact crop unknown', perennial=True,
-                method='Cropland green (NDVI ≥ 0.4) in ≥ 85 % of clear months over 12 months; no crop-mix data for this tehsil',
-                alts='Sugarcane, banana, coconut, orchards, fodder', ev=f'{per_ha:,.0f} ha of perennially green cropland pixels'))
-    identified = sum(c['area'] for c in out)
-    room = max(0.0, active_ha - identified)
-    gl = gl_all
-    extra = []
+    pend_ha = (f('rice_pend_frac') or 0) * geo_ha
+    if pend_ha >= 1:
+        out.append(dict(crop='Possible paddy – flooded, no canopy rise yet', group='Candidate', model=None, trend=None, area=pend_ha,
+            src='Satellite (current season)', presence='Candidate – flooded, no canopy rise yet',
+            method=rule + f'; flooded {RICE_RECENT_DAYS}-75 d ago but the ≥ {RICE_VH_RISE_DB:.0f} dB canopy rise is not yet observed → '
+                   'possible late-transplanted paddy under deep water OR rain-waterlogged field; NOT counted as rice',
+            alts='Late samba / thaladi paddy, waterlogged fallow, tank-bed cultivation',
+            ev=f'{pend_ha:,.0f} ha of flooded cropland pixels without canopy growth (current-season radar)'))
+    mix = mix_for(r)
+    if per_ha >= 1:      # v4.0 explicit ambiguity: satellites prove "perennially green", not which perennial crop
+        p_alts = sorted([(SPAM_NAMES.get(k, k), v) for k, v in mix.items() if k in SPAM_SEASON['Annual']], key=lambda x: -x[1])
+        p_tot = sum(v for _, v in p_alts) or 1
+        out.append(dict(crop='Perennial / plantation crops (type not separable)', group='Perennial crops', model=None, trend=None,
+            area=per_ha, src='Satellite (12-month greenness)', presence='Crop group identified, exact crop unknown', perennial=True,
+            method='Cropland green (NDVI ≥ 0.4) in ≥ 85 % of clear months over 12 months. Sentinel-2/1 cannot separate coconut, '
+                   'sugarcane, banana, mango, rubber or other orchards with this evidence, so no single crop is named',
+            alts=('Prior candidates – ' + MIX_NAME + ' (NOT current evidence): ' +
+                  ', '.join(f'{n} {v / p_tot:.0%}' for n, v in p_alts[:6] if v / p_tot >= 0.03)) if p_alts else
+                 'Coconut, sugarcane, banana, mango, orchards, fodder',
+            ev=f'{per_ha:,.0f} ha of perennially green cropland pixels (physical area)'))
+    identified = sum(c['area'] for c in out if c['group'] not in ('Candidate',))
+    # v4.0: crop statistics / CROPGRIDS are PRIORS – they never create a crop row; they are listed as candidates on the
+    #       unidentified-cropland row (≥ 100 ha and ≥ 3 % of the tehsil's seasonal mix only)
+    cands, cand_src = [], ''
+    gl = [g for g in gl_all if sat_group(g['crop']) not in ('RICE', 'MZ', 'WC', 'SC')]
     if gl:
         dcl = DIST_CL.get(r.gkey) or cl_ha
-        for g in gl:
-            grp = sat_group(g['crop'])
-            if grp in ('RICE', 'MZ', 'WC', 'SC'):
-                continue
-            extra.append(dict(crop=g['crop'], group='Govt-reported crop', model=model_for(g['crop']), trend=None,
-                area=g['area'] * cl_ha / dcl, src='Govt district statistics (apportioned)', presence='Probable crop identification',
-                method=f"DES district APY (avg {g['years']}) apportioned by cropland share; not a current-season observation",
-                alts='—', ev=f"District {g['crop']} {g['area']:,.0f} ha × tehsil cropland share", darea=g['area']))
+        cands = [(g['crop'], g['area'] * cl_ha / dcl) for g in gl]
+        cand_src = 'Govt district APY statistics (apportioned by cropland share)'
     else:
-        mix = mix_for(r)
-        how = mix_how(r)
-        for code, a in (mix or {}).items():
-            name = SPAM_NAMES.get(code, f'SPAM crop {code.upper()}')
-            if code in SPAM_SEASON['Annual'] or sat_group(name) in ('RICE', 'MZ', 'WC'):
-                continue
-            if not (code in SPAM_SEASON['Both'] or code in SPAM_SEASON.get(SEASON, set())):
-                continue
-            extra.append(dict(crop=name, group='Modelled crop mix', model=SPAM_TO_MODEL.get(code), trend=None, area=a,
-                src=MIX_SRC, presence='Probable crop identification',
-                method=f"{MIX_NAME} modelled crop mix (from crop statistics c. 2020); season by crop type; "
-                       "NOT a current-season observation", alts='Other crops of the same season',
-                ev=f'{a:,.0f} ha {MIX_NAME} harvested area ({how})' + ('; all-season total' if code in SPAM_SEASON['Both'] else '')))
-    tot = sum(c['area'] for c in extra)
-    # v3.5 Phase 2: a crop that dominates the unexplained annual cropland uses that area's MEASURED curve ('OTH' pixels)
-    if tot > 0:
-        top = max(extra, key=lambda c: c['area'])
-        if top['area'] / tot >= OTHER_CURVE_SHARE and top['model'] in CROP_MODELS:
-            top['trend'] = 'OTH'
-            top['method'] += (f'; stage evidence = measured Sentinel-2 curve of the remaining annual cropland (not paddy / maize / '
-                              f'winter-cereal / perennial pixels), where {top["crop"]} is {top["area"] / tot:.0%} of the modelled seasonal area')
-    for c in extra:
-        if tot > room:
-            c['area'] = c['area'] * room / tot if tot else 0
-            c['ev'] += ' – scaled to fit unexplained active cropland'
-    out += [c for c in extra if c['area'] >= 1]
-    unknown = active_ha - sum(c['area'] for c in out if c['group'] != 'Perennial crops' and c['model'] != 'RICE_RECENT') - per_ha
+        cands = [(SPAM_NAMES.get(k, k), v) for k, v in mix.items()
+                 if k not in SPAM_SEASON['Annual'] and sat_group(SPAM_NAMES.get(k, k)) not in ('RICE', 'MZ', 'WC')
+                 and (k in SPAM_SEASON['Both'] or k in SPAM_SEASON.get(SEASON, set()))]
+        cand_src = f'{MIX_NAME} ({mix_how(r)})'
+    c_tot = sum(v for _, v in cands) or 1
+    cands = sorted([(n, v) for n, v in cands if v >= 100 and v / c_tot >= 0.03], key=lambda x: -x[1])[:6]
+    unknown = active_ha - sum(c['area'] for c in out if c['group'] not in ('Perennial crops', 'Candidate') and c['model'] != 'RICE_RECENT') - per_ha - pend_ha
     if unknown >= 1:
-        out.append(dict(crop='Active cropland – crop unknown', group='Unidentified', model=None, trend=None, area=unknown,
-            src='Satellite (current season)', presence='Active cropland, crop unknown',
-            method='Cropland green this season (NDVI ≥ 0.35) not explained by identified crops' + (
-                '' if (GOVT_AREA or SPAM_TEH) else ' – no crop-mix source loaded'),
-            alts='Groundnut, pulses, millets, cotton, vegetables, maize …', ev=f'{unknown:,.0f} ha active cropland not attributed to any crop' + wc_note))
+        out.append(dict(crop='Active cropland – crop unknown', group='Unidentified', model=None, trend='OTH', area=unknown,
+            src='Satellite (current season)', presence='Active cropland, crop unknown', prior=cands, prior_src=cand_src,
+            method='Cropland green this season (NDVI ≥ 0.35) not explained by any crop with current-season crop-specific evidence',
+            alts=(f'Prior candidates – {cand_src}, NOT current evidence: ' + ', '.join(f'{n} {v / c_tot:.0%}' for n, v in cands))
+                 if cands else 'No crop-statistics prior available',
+            ev=f'{unknown:,.0f} ha active cropland not attributed to any crop' + wc_note))
     if not out:
-        out.append(dict(crop='Fallow – no active crop' if cur_share >= 0.2 else '—', group='—', model=None, trend=None, area=0.0,
-            src='Satellite (current season)',
+        out.append(dict(crop='Fallow – no active crop' if cur_share >= 0.2 else 'No clear observation this season', group='—',
+            model=None, trend=None, area=0.0, src='Satellite (current season)',
             presence='No active crop detected' if cur_share >= 0.2 else 'Insufficient data',
-            method='No cropland pixel was green this season' if cur_share >= 0.2 else 'Too few clear observations', alts='—', ev='—'))
+            method='No cropland pixel was green this season' if cur_share >= 0.2 else 'Too few clear Sentinel-2 observations this season',
+            alts='—', ev='—'))
     for c in out:
         c.setdefault('darea', None)
-    return out, dict(active=active_ha, identified=sum(c['area'] for c in out if c['group'] not in ('Unidentified', '—')))
+    return out, dict(active=active_ha, identified=sum(c['area'] for c in out if c['group'] not in ('Unidentified', '—', 'Candidate')))
 
 def dmed(key, src):
     out = {}
@@ -1716,13 +1861,32 @@ for lgd, mix in SPAM_TEH.items():
 _dup_names = TEH.groupby(['dkey', 'tehsil']).lgd.transform('count')
 DUP_NAME = dict(zip(TEH.lgd, _dup_names > 1))
 
-EST_SOURCE = {'calendar': 'Calendar estimate (Option A): planting date + published crop stage durations – NOT confirmed by satellite',
-              'curve': 'Cropland-curve estimate (Option A): measured S2 curve phase mapped to a generic stage – no crop-specific model',
-              'season': 'Season-calendar estimate (Option A): days since season start – no clear satellite curve',
-              'perennial': 'Satellite: perennially green for 12 months (standing perennial crop)',
-              'fallow': 'Satellite: no cropland green this season'}
-GENERIC_BY_PHASE = {'pre': 'Land Prep / Sowing', 'rising': 'Vegetative', 'peak': 'Flowering', 'declining': 'Grain Fill/Maturity',
-                    'post': 'Harvest / post-harvest', 'flat': 'Vegetative (steady green canopy)'}
+# ---- v4.0 stage resolution vocabulary (Final Crop Stage is ALWAYS a crop-specific stage or one of these explicit statuses)
+U_IDENTITY  = 'Stage unresolved – crop identity not established'
+U_PERENNIAL = 'Stage unresolved – perennial crop type not separable (coconut / sugarcane / banana / orchards)'
+U_NOMODEL   = 'Stage unresolved – no sourced stage model for this crop'
+U_NOSOW     = 'Stage unresolved – sowing date not observed (only a recommended calendar window)'
+U_INSUFF    = 'Stage unresolved – insufficient crop-specific satellite observations'
+U_CONFLICT  = 'Stage unresolved – satellite evidence contradicts the expected stage'
+U_COHORTS   = 'Stage unresolved – transplanting dates spread over several cohorts'
+U_GATE      = 'Stage unresolved – rejected by quality checks'
+U_OLD       = 'Stage unresolved – planting date older than the crop duration (crop may be harvested)'
+UNRESOLVED  = (U_IDENTITY, U_PERENNIAL, U_NOMODEL, U_NOSOW, U_INSUFF, U_CONFLICT, U_COHORTS, U_GATE, U_OLD)
+STAGE_METHOD = {'field': 'Field-verified stage',
+                'satellite': 'Satellite-observed: crop-pixel S2/S1 phenology consistent with the crop-specific stage model',
+                'model': 'Model-inferred: OBSERVED planting date (Sentinel-1 / green-up) + published crop stage durations; '
+                         'curve could not confirm it',
+                'fallow': 'Satellite-observed: no cropland green this season',
+                'unresolved': 'Unresolved – see Stage Unresolved Reason'}
+NEXT_ACTION = {U_IDENTITY: 'Field / crop-cutting survey or DCS (AgriStack) crop record to name the crop',
+               U_PERENNIAL: 'Plantation inventory (Horticulture dept.) or field visit to separate the perennial crop',
+               U_NOMODEL: 'Add a sourced (TNAU / ICAR) stage table for this crop',
+               U_NOSOW: 'Wait for crop-specific green-up in the next composites, or record the sowing date in the field',
+               U_INSUFF: 'Re-run after the next clear Sentinel-2 composites, or field-verify the stage',
+               U_CONFLICT: 'Field-verify: the satellite curve and the duration model disagree',
+               U_COHORTS: 'Report stages per cohort (field sample) – one tehsil stage would be misleading',
+               U_GATE: 'See QC Flags for the rejecting check; field-verify',
+               U_OLD: 'Check whether the crop is harvested (field visit / next composites)'}
 
 def stage_index_at(table, dap):
     """Index of the stage whose (mid) start day is the last one ≤ days-after-planting."""
@@ -1733,47 +1897,70 @@ def stage_index_at(table, dap):
             cur = k
     return 0 if cur is None else cur
 
-def calendar_estimate(c, model, table, S, s_w, dur_hi, prefix, ph, ph_all, r, lgd, s_txt=''):
-    """Option A. Returns (stage text, code, kind, confidence, next stage, next window, explanation). Always returns a stage."""
-    lab = ' (calendar estimate)'
-    if c.get('presence') == 'No active crop detected':
-        return 'Fallow – no active crop', 'FALLOW', 'fallow', 50, '— (next sowing)', None, 'no cropland pixel green this season'
-    if table and S:
-        dap = (TODAY - S).days
-        src_txt = s_txt or f'planting ~{S:%d-%b-%Y}'
-        if dap < 0:
-            return ('Land Prep' + lab, f'{prefix}-S00-EST', 'calendar', 20, table[0][0], None,
-                    f'{src_txt} is ahead – field preparation expected')
-        if dur_hi and dap > dur_hi + 15:
-            return ('Harvested / post-harvest' + lab, f'{prefix}-HARV-EST', 'calendar', 25, '— (next crop / fallow)', None,
-                    f'{dap} days since {src_txt} exceeds the crop duration ({dur_hi} d)')
-        k = stage_index_at(table, dap)
-        nxt = table[k + 1][0] if k + 1 < len(table) else '— (crop cycle complete)'
-        st = table[k + 1][1] if k + 1 < len(table) else None
-        nd = ((S + dt.timedelta(days=st[0]), S + dt.timedelta(days=st[1])) if isinstance(st, tuple) else
-              (S + dt.timedelta(days=st), S + dt.timedelta(days=st))) if st is not None else None
-        conf = int(min(45, round(15 + 35 * s_w)))
-        return (table[k][0] + lab, f'{prefix}-S{k + 1:02d}-EST', 'calendar', conf, nxt, nd,
-                f'{dap} days after {src_txt} → {table[k][0]} by the published {model} stage durations; satellite evidence could not '
-                'confirm it, so it is published as a calendar estimate')
-    if model in CROP_MODELS:                                 # crop with a stage model but no sowing window open now
-        table = CROP_MODELS[model]['stages']
-        wins = [w for _, w, _ in sow_windows(model, r.state, lgd, TODAY + dt.timedelta(days=60)) if w and w[0] > TODAY]
-        nxt_w = min(wins, key=lambda w: w[0]) if wins else None
-        return ('Land Prep' + lab, f'{model.upper().replace(" ", "")[:6]}-S00-EST', 'calendar', 15, table[0][0], nxt_w,
-                f'no {model} sowing window is open now' + (f'; next window opens {nxt_w[0]:%d-%b-%Y}' if nxt_w else ''))
-    if c.get('perennial'):
-        return ('Standing perennial crop (no seasonal stage)', 'PERENNIAL', 'perennial', 50, '—', None,
-                'perennially green for 12 months – perennial crops have no seasonal stage sequence')
-    pp = ph if (ph and ph.get('phase')) else (ph_all if ph_all and ph_all.get('phase') else None)
-    if pp:
-        return (GENERIC_BY_PHASE[pp['phase']] + ' (cropland curve estimate)', f"GEN-{pp['phase'].upper()}-EST", 'curve', 25, '—', None,
-                f"generic stage from the measured {'crop-pixel' if pp is ph else 'tehsil cropland'} curve: {PHASES[pp['phase']]}")
-    d = (TODAY - SEASON_START).days
-    g = ('Sowing' if d < 25 else 'Vegetative' if d < 70 else 'Flowering' if d < 95 else 'Grain Fill/Maturity' if d < 125 else 'Harvest')
-    return (g + ' (season calendar estimate)', 'GEN-SEASON-EST', 'season', 10, '—', None,
-            f'{d} days since the {SEASON} season start ({SEASON_START:%d-%b}); no clear satellite curve – lowest confidence')
+def stage_bounds(table, k, S):
+    """Start / end date range of stage k for planting date S (start of k → start of k+1)."""
+    st = table[k][1]
+    a = S + dt.timedelta(days=int((st[0] + st[1]) / 2 if isinstance(st, tuple) else st))
+    if k + 1 < len(table):
+        sn = table[k + 1][1]
+        b = S + dt.timedelta(days=int((sn[0] + sn[1]) / 2 if isinstance(sn, tuple) else sn) - 1)
+    else:
+        b = None
+    return a, b
 
+def resolve_unconfirmed(c, model, table, S, s_observed, dur_hi, prefix, stage_note, reject, rice_conflict, cal_cands):
+    """v4.0 replacement of the v3.5 'Option A'. Returns (final, code, kind, conf, next stage, next window, why, unresolved reason).
+    A crop-specific stage is given ONLY from an OBSERVED planting date + the crop's own stage table; everything else is an
+    explicit unresolved status (no generic curve stages, no calendar-midpoint planting dates)."""
+    if c.get('presence') == 'No active crop detected':
+        return 'Fallow – no active crop', 'FALLOW', 'fallow', 50, '— (next sowing)', None, 'no cropland pixel green this season', ''
+    if c['group'] in ('Unidentified', 'Candidate', '—'):
+        return U_IDENTITY, 'UNRESOLVED-ID', 'unresolved', 0, '', None, 'crop not identified with current-season evidence', U_IDENTITY
+    if c.get('perennial'):
+        return U_PERENNIAL, 'UNRESOLVED-PER', 'unresolved', 0, '', None, 'perennial crop type not separable', U_PERENNIAL
+    if not table and model not in CROP_MODELS and model not in ('RICE', 'RICE_RECENT', 'RICE_HARVESTED'):
+        return U_NOMODEL, 'UNRESOLVED-MODEL', 'unresolved', 0, '', None, f"no sourced stage table for {c['crop']}", U_NOMODEL
+    if model == 'RICE' and not S:
+        return U_COHORTS, 'UNRESOLVED-COH', 'unresolved', 0, '', None, 'paddy transplanting cohorts too spread', U_COHORTS
+    if not S:
+        return U_INSUFF, 'UNRESOLVED-NOSOW', 'unresolved', 0, '', None, 'no planting date observed and no calendar window', U_INSUFF
+    if not s_observed:
+        return U_NOSOW, 'UNRESOLVED-NOSOW', 'unresolved', 0, '', None, 'planting date would be a calendar assumption', U_NOSOW
+    if reject:
+        return U_GATE, 'UNRESOLVED-QC', 'unresolved', 0, '', None, '; '.join(reject), U_GATE
+    if rice_conflict or 'contradict' in stage_note or 'outside every' in stage_note:
+        return U_CONFLICT, 'UNRESOLVED-CONFLICT', 'unresolved', 0, '', None, stage_note or 'radar / optical dates disagree', U_CONFLICT
+    dap = (TODAY - S).days
+    if dur_hi and dap > dur_hi + 15:
+        return U_OLD, 'UNRESOLVED-OLD', 'unresolved', 0, '', None, f'{dap} d since planting > crop duration {dur_hi} d', U_OLD
+    if not table:
+        return U_INSUFF, 'UNRESOLVED-INSUFF', 'unresolved', 0, '', None, stage_note or 'no stage table', U_INSUFF
+    if dap < 0:
+        return U_NOSOW, 'UNRESOLVED-FUTURE', 'unresolved', 0, '', None, 'planting date in the future', U_NOSOW
+    k = stage_index_at(table, dap)
+    nxt = table[k + 1][0] if k + 1 < len(table) else '— (crop cycle complete)'
+    st = table[k + 1][1] if k + 1 < len(table) else None
+    nd = ((S + dt.timedelta(days=st[0]), S + dt.timedelta(days=st[1])) if isinstance(st, tuple) else
+          (S + dt.timedelta(days=st), S + dt.timedelta(days=st))) if st is not None else None
+    return (table[k][0] + ' (model-inferred)', f'{prefix}-S{k + 1:02d}-MOD', 'model', 30, nxt, nd,
+            f'{dap} d after the observed planting date ({S:%d-%b-%Y}) → {table[k][0]} by the published {c["crop"]} stage durations; '
+            f'satellite curve could not confirm it ({stage_note or "too few clear crop-pixel composites"})', '')
+
+def freshness(d):
+    if d is None:
+        return 'No usable observation'
+    age = (TODAY - d).days
+    return 'Fresh (≤ 10 d)' if age <= 10 else 'Recent (11-20 d)' if age <= STALE_DAYS else 'Stale (> 20 d)'
+
+def valid_obs_date(v, base):
+    """Convert a day offset to a date; rejects anything before the Sentinel-2 / Sentinel-1 era or after today (no epoch dates)."""
+    if v is None:
+        return None
+    d = base + dt.timedelta(days=int(math.floor(v)))
+    return d if dt.date(2014, 4, 3) <= d <= TODAY else None
+
+EVIDENCE_PRESENCE = ('Confirmed – field verified', 'Detected – current-season satellite evidence', 'Probable crop identification')
+DOM_MIN_SHARE = 0.25          # a crop is called "dominant" only if its current-season evidence covers ≥ 25 % of active cropland
 T1_ROWS, T8_ROWS, DOM, DOM_NOTE, AREA_ROWS = [], [], {}, {}, []
 for r in TEH.itertuples():
     lgd = r.lgd
@@ -1912,7 +2099,7 @@ for r in TEH.itertuples():
             s1n = fnum(mp.get('rice_s1_obs')) or 0
             dwf = (fnum(mp.get('rice_dw_frac')) or 0) / (fnum(mp.get('rice_frac')) or 1)
             s2_ok = bool(ph and ph['cx'] and ph['phase'] in ('rising', 'peak', 'declining', 'post') and not rice_conflict)
-            c['presence'] = ('High-confidence satellite identification' if (s2_ok and s1n >= 6 and dwf >= 0.5)
+            c['presence'] = ('Detected – current-season satellite evidence' if (s2_ok and s1n >= 6 and dwf >= 0.5)
                              else 'Probable crop identification')
             if not s2_ok:
                 unc_notes.append('paddy flooding + radar canopy growth detected, but optical crop development not confirmed')
@@ -1920,9 +2107,10 @@ for r in TEH.itertuples():
                 unc_notes.append(f'Dynamic World labels only {dwf:.0%} of these pixels as crops / flooded vegetation (last 60 d)')
         if field:
             c['presence'] = 'Confirmed – field verified'
-        w_id = {'Confirmed – field verified': 1.0, 'High-confidence satellite identification': 0.85, 'Probable crop identification':
+        w_id = {'Confirmed – field verified': 1.0, 'Detected – current-season satellite evidence': 0.85, 'Probable crop identification':
                 (0.5 if 'Historical' in c['src'] else 0.55 if 'Satellite' in c['src'] else 0.3), 'Crop group identified, exact crop unknown': 0.35,
-                'Active cropland, crop unknown': 0.1, 'No active crop detected': 0.5, 'Insufficient data': 0.0}[c['presence']]
+                'Active cropland, crop unknown': 0.1, 'No active crop detected': 0.5, 'Insufficient data': 0.0,
+                'Candidate – flooded, no canopy rise yet': 0.15}[c['presence']]
         id_conf = round(100 * w_id * ((0.5 + 0.5 * dq) if 'Satellite' in c['src'] or 'Historical' in c['src'] else 1))
 
         # ---- crop-specific stage (each crop uses ONLY its own stage table; tehsil-wide curves are never used as a crop stage)
@@ -2045,7 +2233,8 @@ for r in TEH.itertuples():
             readiness, days_left = NA, None
         harv_conf = round((sow_conf or 0) * (0.8 if final != UNC else 0.4)) if harvest_lo else ''
         if harvest_lo:
-            h_txt = ((f'Maturity {wtxt(mat_lo, mat_hi)} | ' if mat_lo and prefix != 'RICE' else '')
+            h_txt = (('IF sown within the recommended window (sowing NOT observed): ' if s_w < 0.5 and not field else
+                      'From the observed planting date: ') + (f'Maturity {wtxt(mat_lo, mat_hi)} | ' if mat_lo and prefix != 'RICE' else '')
                      + f'Harvest {wtxt(harvest_lo, harvest_hi)} ({readiness})'
                      + (' – rice harvest-ready at physiological maturity' if prefix == 'RICE' else '')
                      + f' | harvest-date confidence {harv_conf} (provisional score)')
@@ -2097,7 +2286,7 @@ for r in TEH.itertuples():
             reject.append('QC1: cereal stage on sugarcane')
         if not crop_trend and final != UNC and not field and model not in ('RICE_RECENT', 'RICE_HARVESTED'):
             reject.append('QC2: stage without crop-specific pixels')
-        if 'Historical' in c['src'] and c['presence'] in ('High-confidence satellite identification', 'Confirmed – field verified') and not field:
+        if 'Historical' in c['src'] and c['presence'] in ('Detected – current-season satellite evidence', 'Confirmed – field verified') and not field:
             qc.append('QC3: historical map cannot confirm current presence'); c['presence'] = 'Probable crop identification'
         if over > 1:
             qc.append(f'QC5: identified crop area exceeds active cropland by {over:,.0f} ha')
@@ -2117,11 +2306,14 @@ for r in TEH.itertuples():
             reject.append('QC13: stage not in this crop\'s own stage sequence')
         if fnum(mp.get('active_frac')) is None:
             qc.append('QC14: active-cropland fraction missing – areas not computed (not zero)')
-        s2_last = fnum(cur.get('s2_last_t')); s1_last = fnum(cur.get('s1_last_t'))
-        s2_last_d = (TODAY - dt.timedelta(days=30) + dt.timedelta(days=int(s2_last))) if s2_last is not None else None
-        s1_last_d = (TODAY - dt.timedelta(days=30) + dt.timedelta(days=int(s1_last))) if s1_last is not None else None
-        if s2_last_d is None or (TODAY - s2_last_d).days > 20:
-            qc.append('QC15: no clear Sentinel-2 scene in the last 20 days (mean over cropland) – optical evidence stale')
+        # v4.0 actual acquisition dates (OBS reduce): max = latest scene with any clear cropland pixel, median = typical latest clear date
+        _ob = TODAY - dt.timedelta(days=60)
+        s2_last_d = valid_obs_date(fnum(cur.get('s2_day_max')), _ob); s2_med_d = valid_obs_date(fnum(cur.get('s2_day_median')), _ob)
+        s1_last_d = valid_obs_date(fnum(cur.get('s1_day_max')), _ob)
+        usable_d = max([d for d in (s2_med_d, s1_last_d if prefix == 'RICE' else None) if d], default=None)
+        fresh = freshness(s2_med_d)
+        if s2_med_d is None or (TODAY - s2_med_d).days > STALE_DAYS:
+            qc.append(f'QC15: typical latest clear Sentinel-2 date over cropland {ds(s2_med_d) or "none in 60 d"} – optical evidence stale')
         if c['src'].startswith('Historical') and not field:
             qc.append('QC16: crop identity from a 2021 map + current greenness – unverified this season')
         if reject and not field:
@@ -2130,29 +2322,34 @@ for r in TEH.itertuples():
             final, code, stage_conf, prev_s, next_s, next_date, stage_win = UNC, 'NOT-DETERMINED', 0, '', '', None, None
             reason += ' | Publish gate: ' + '; '.join(reject) + ' → Stage not determined'
             est_stage = est_stage.split(' | current stage window')[0]
-        # ---- v3.5 Option A: never leave the stage empty – publish the crop-calendar stage, clearly labelled, with a low confidence
-        est_kind = None
-        if CALENDAR_ESTIMATE and final == UNC and not field:
-            S_est, s_est_txt = S, ''
-            if model in ('RICE', 'RICE_RECENT') and not table:      # paddy without one transplanting date: use the mean flood date
-                ft_mean = fnum(mp.get('rice_flood_t' if model == 'RICE' else 'rice_recent_t'))
-                if ft_mean is not None:
-                    S_est = S1_START + dt.timedelta(days=int(ft_mean))
-                    s_est_txt = f'mean Sentinel-1 flooding (puddling) date of the paddy pixels ~{S_est:%d-%b-%Y}'
-                    _sn, rc_ = rice_context(S_est, r.state, lgd)
-                    F_lo, F_hi = rice_field_duration(rc_)
-                    t_lo, t_hi = rice_stage_table(F_lo), rice_stage_table(F_hi)
-                    table = [(n, (a_, b_), bk, al) for (n, a_, bk, al), (_, b_, _, _) in zip(t_lo, t_hi)]
-                    prefix = 'RICE'
+        # ---- v4.0 stage resolution: satellite-observed / model-inferred / field / explicit unresolved status (never generic)
+        stage_kind, unres_reason, stage_rng = None, '', (None, None)
+        if field and final != UNC:
+            stage_kind = 'field'
+        elif final != UNC and model == 'RICE_HARVESTED':
+            stage_kind = 'satellite'
+        elif final != UNC:
+            stage_kind = 'satellite'
+            optical_only = prefix != 'RICE'
+            if optical_only and (s2_med_d is None or (TODAY - s2_med_d).days > STALE_DAYS):
+                stage_kind = 'model'          # do not call a stage satellite-confirmed on stale optical evidence
+                final = final + ' (model-inferred)'
+                unc_notes.append(f'optical evidence stale (typical latest clear S2 {ds(s2_med_d) or "none"}) – stage downgraded to model-inferred')
+                stage_conf = min(stage_conf or 0, 35)
+        else:
             dur_hi = ((F_hi if prefix == 'RICE' else CROP_MODELS.get(model, {}).get('harvest', (0, 0))[1]) if table else None)
-            final, code, est_kind, stage_conf, next_s, next_date, est_why = calendar_estimate(
-                c, model, table, S_est, s_w if S else 0.3, dur_hi, prefix, ph, ph_all, r, lgd, s_est_txt)
-            names_t = [t[0] for t in table] if table else names_t
-            reason += f' | Option A – {est_why}'
-            if est_kind == 'calendar':
-                qc.append('QC17: stage is a CALENDAR ESTIMATE (not confirmed by satellite evidence) – low confidence')
-            elif est_kind == 'curve':
-                qc.append('QC17: stage is a generic CROPLAND-CURVE ESTIMATE (no crop-specific stage model) – low confidence')
+            final, code, stage_kind, stage_conf, next_s, next_date, why, unres_reason = resolve_unconfirmed(
+                c, model, table, S, s_w >= 0.5, dur_hi, prefix, stage_note, reject, rice_conflict, cal_cands)
+            reason += f' | Stage resolution – {why}'
+            if stage_kind == 'model':
+                qc.append('QC17: stage MODEL-INFERRED from an observed planting date + crop durations – not confirmed by the satellite curve')
+            elif stage_kind == 'unresolved':
+                qc.append(f'QC18: {unres_reason}')
+        if stage_kind in ('satellite', 'model', 'field') and table and S:
+            k_ = next((k for k, t in enumerate(table) if final.split(' (')[0].split(' →')[0] == t[0]), None)
+            if k_ is not None:
+                stage_rng = stage_bounds(table, k_, S)
+        alt_stages = ', '.join(cn[0] for cn in cal_cands) if cal_cands else ''
         dq_status = 'Good' if (share >= 0.5 and ph and ph['n'] >= 8) else ('Fair' if share >= 0.2 else 'Poor')
         qc.insert(0, f'Data quality: {dq_status}')
 
@@ -2169,18 +2366,23 @@ for r in TEH.itertuples():
                (['GDD_BASE'] if gdd is not None else []) + (['IMD_HEAVY'] if heavy is not None else [])
         source = ' || '.join(REFS[k] for k in dict.fromkeys(refs))
         insight = (f"{c['crop']}: {final if final != UNC else 'stage uncertain'}"
-                   + (f"; planted ~{S:%d-%b} ({s_method.split(' (')[0].split(';')[0]})" if S else '')
+                   + (f"; planted ~{S:%d-%b} ({s_method.split(' (')[0].split(';')[0]})" if (S and s_w >= 0.5) else '')
                    + (f"; harvest {wtxt(harvest_lo, harvest_hi)}" if harvest_lo else '')
                    + f"; {health.split(';')[0]}"
                    + ('. Field verification recommended: ' + ('confirm crop identity' if c['presence'] not in
-                      ('High-confidence satellite identification', 'Confirmed – field verified') else 'confirm stage')
+                      ('Detected – current-season satellite evidence', 'Confirmed – field verified') else 'confirm stage')
                       if not field else ''))
         geo_val = '; '.join(x for x in [
             'LGD codes present' if (r.slgd and r.dlgd and lgd) else 'Missing LGD code',
             'duplicate tehsil name in district (disambiguated by LGD code)' if DUP_NAME.get(lgd) else None,
             f'area {geo_ha:,.0f} ha (EPSG:6933 equal-area, full-resolution LGD polygon)'] if x)
         s2s, s1s = g('s2_scenes'), g('s1_scenes')
-        sow_ev = (f'{s_method}; uncertainty ±{(unc_days or 0) // 2} d' if S else 'Not estimable – no crop-specific signal or calendar window')
+        s_obs = bool(S) and s_w >= 0.5
+        sow_ev = (f'{s_method}; uncertainty ±{(unc_days or 0) // 2} d' if s_obs else
+                  f'Recommended sowing window only – NOT an observed sowing date ({s_method})' if S else
+                  'Not estimable – no crop-specific signal or calendar window')
+        if S and not s_obs:
+            sow_conf = ''
 
         T1_ROWS.append([r.state, r.slgd, r.district, r.dlgd, r.tehsil, lgd, BOUNDARY_UNIT,
             c['crop'], season_lbl, c['presence'],
@@ -2188,24 +2390,33 @@ for r in TEH.itertuples():
             f"Alternatives: {c['alts']} | Ground verification: {'Yes' if field else 'No'} | Presence score {id_conf}/100 is a provisional "
             f"rubric score, NOT a probability", id_conf,
             round(c['area'], 1), round(cl_ha, 1), (round(c['darea'], 1) if c['darea'] else ''), f"{c['ev']} [{c['src']}] || {area_text}",
-            ds(S), ds(e1), ds(e2), sow_conf, sow_ev,
-            sat_stage, est_stage, final, code, (EST_SOURCE[est_kind] if est_kind else 'Field observation' if field and f_stage == 1.0 else
-                ('Sentinel-1 transplanting date + TNAU/IRRI rice stage durations + S2 NDVI/EVI and S1 VH curves of paddy pixels'
-                 if prefix == 'RICE' and model == 'RICE' else
-                 'Sentinel-1 recent flooding + TNAU rice calendar' if model == 'RICE_RECENT' else
-                 'Crop-pixel S2 NDVI/EVI curves + published crop-specific stage durations')
-                if (table and final != UNC) else ('Calendar only – NOT confirmed, not used as the stage' if table else NA)),
-            ds(s2_last_d) if s2_last_d else (ds(ph['obs']) if ph and ph['obs'] else ''), stage_conf, reason, h_txt,
+            ds(S) if s_obs else '', ds(e1), ds(e2), sow_conf, sow_ev,
+            sat_stage, est_stage, final, code, (STAGE_METHOD[stage_kind] + (
+                ' | Sentinel-1 transplanting date + TNAU/IRRI rice stage durations + S2 NDVI/EVI and S1 VH curves of paddy pixels'
+                if prefix == 'RICE' and model == 'RICE' else
+                ' | Sentinel-1 recent flooding + TNAU rice calendar' if model == 'RICE_RECENT' else
+                ' | Sentinel-1 paddy cycle + Sentinel-2 NDVI after harvest' if model == 'RICE_HARVESTED' else
+                ' | crop-pixel S2 NDVI/EVI curves + published crop-specific stage durations' if table else '')),
+            ds(usable_d) if stage_kind in ('satellite', 'model') and usable_d else (ds(field.get('observation_date')) if field else ''),
+            stage_conf, reason, h_txt,
             health, wsig or NA, (f"Crop pixels: {ph['reason']}" if ph else f"Tehsil cropland (context only): {ph_all['reason']}"), insight,
             r4(g('NDVI_CUR')), r4(g('EVI_CUR')), r4(g('NDRE_CUR')), r4(g('NDMI_CUR')), r4(g('NDWI_CUR')),
             r4(g('s1_VV')), r4(g('s1_VH')), r4(g('VV_VH')),
             ' | '.join('' if v is None else f'{v:.2f}' for v in (crop_trend if crop_trend else trend_all)) +
             (' [crop pixels]' if crop_trend else ' [tehsil cropland]'),
             pr_(rain), rain_period, pr_(t30),
-            round(share, 3), (f"{(s2s or 0):.0f} / {(s1s or 0):.0f} in last 30 d | last clear S2 ≈ {ds(s2_last_d) or 'none'} | "
-                              f"last S1 ≈ {ds(s1_last_d) or 'none'} | latest optical composite {TREND_ENDS[-1] - dt.timedelta(days=14)} to "
-                              f"{TREND_ENDS[-1]}"), 'Field verified' if field else 'Not field-verified',
-            geo_val, evid, '; '.join(qc), overall, MODEL_VERSION, source, ds(TODAY), RUN_ID])
+            round(share, 3), (f"{(s2s or 0):.0f} / {(s1s or 0):.0f} clear observations per cropland pixel in last 30 d | latest S2 scene "
+                              f"with clear cropland {ds(s2_last_d) or 'none in 60 d'} (typical latest clear date {ds(s2_med_d) or 'none'}) | "
+                              f"latest S1 scene {ds(s1_last_d) or 'none in 60 d'}"), 'Field verified' if field else 'Not field-verified',
+            geo_val, evid, '; '.join(qc), overall, MODEL_VERSION, source, ds(TODAY), RUN_ID,
+            # ---- v4.0 appended columns (existing 57 unchanged)
+            ds(stage_rng[0]) if stage_rng[0] else '', ds(stage_rng[1]) if stage_rng[1] else '',
+            ds(s2_last_d) or '', ds(s1_last_d) or '', ds(usable_d) or '', (TODAY - usable_d).days if usable_d else '',
+            fresh, STAGE_METHOD[stage_kind], {'field': 'Field-verified', 'satellite': 'Satellite-observed (not field-verified)',
+                                              'model': 'Model-inferred (not satellite-confirmed)', 'fallow': 'Satellite-observed',
+                                              'unresolved': 'Unresolved'}[stage_kind],
+            alt_stages, (f'{unres_reason} → next action: {NEXT_ACTION.get(unres_reason, "")}' if unres_reason else ''),
+            c['alts'], AREA_BASIS.get(c['group'], 'Seasonal crop area this season (current-season satellite pixels)')])
 
         # ---- Tab 8: ideal windows from TNAU calendar + published stage durations (fallback: tehsil satellite history)
         ideal_src, ideal_conf, w_sow, dur_txt, ideal_h, nursery_mid = NA, '', None, '', None, 0
@@ -2261,78 +2472,71 @@ for r in TEH.itertuples():
             i_s = base_w[0] + dt.timedelta(days=s_lo)
             i_e = (base_w[1] + dt.timedelta(days=e_hi)) if e_hi is not None else None
             act = dev = ''
-            if final_bucket is not None and bi <= final_bucket and S:
+            if final_bucket is not None and bi <= final_bucket and S and s_w >= 0.5:
                 a_d = S + dt.timedelta(days=s_lo)
                 i_mid = i_s + (base_w[1] - base_w[0]) / 2          # deviation vs the MIDDLE of the ideal window (v3.0 used its first day)
                 act, dev = ds(a_d), (a_d - i_mid).days
             bucket_cols += [ds(i_s), ds(i_e), act, dev]
         sow_dev = timing = ''
-        if w_sow and S:
+        if w_sow and S and s_w >= 0.5:
             mid = w_sow[0] + (w_sow[1] - w_sow[0]) / 2
             ref_S = S - dt.timedelta(days=nursery_mid) if prefix == 'RICE' else S   # rice: compare nursery sowing with TNAU window
             sow_dev = (ref_S - mid).days
             timing = 'Early' if ref_S < w_sow[0] else ('Late' if ref_S > w_sow[1] else 'On Time')
         nb = next((t[2] for t in (table or []) if t[0] == next_s), None)
+        if stage_kind not in ('satellite', 'model', 'field'):
+            nb, next_s, next_date = None, '', None
+        m_cat, m_op, m_eq = machinery_for(model, nb)
+        obs_S = S if (S and s_w >= 0.5) else None
         T8_ROWS.append([r.state, r.slgd, r.district, r.dlgd, r.tehsil, lgd, c['crop'], season_lbl, final,
             ideal_src, ideal_conf, wtxt(*w_sow) if w_sow else NA, wtxt(*ideal_h) if ideal_h else NA, dur_txt or NA,
-            (ds(S) + (' (transplanting' if prefix == 'RICE' else ' (sowing') + (', estimated)' if s_w < 1 else ', field record)')) if S else '', sow_dev, timing or NA,
-            ds(harvest_lo + (harvest_hi - harvest_lo) / 2) if harvest_lo else '', (max(0, (harvest_lo + (harvest_hi - harvest_lo) / 2 - TODAY).days) if harvest_lo else ''),
-            next_s or '—', (ds(next_date[0]) if next_date else ''), MACHINERY_BY_BUCKET.get(nb, 'None') if nb else 'None']
-            + bucket_cols + ['; '.join(qc), RUN_ID])
+            (ds(obs_S) + (' (transplanting' if prefix == 'RICE' else ' (sowing') + (', estimated from satellite)' if s_w < 1 else ', field record)')) if obs_S else '', sow_dev, timing or NA,
+            ds(harvest_lo + (harvest_hi - harvest_lo) / 2) if (harvest_lo and obs_S) else '',
+            (max(0, (harvest_lo + (harvest_hi - harvest_lo) / 2 - TODAY).days) if (harvest_lo and obs_S) else ''),
+            next_s or '—', (ds(next_date[0]) if next_date else ''), m_cat]
+            + bucket_cols + ['; '.join(qc), RUN_ID,
+            # v4.0 appended
+            m_op or ('Not applicable – stage unresolved' if stage_kind == 'unresolved' else ''), m_eq,
+            (f"{CROP_FAMILY.get(model, '')} × next stage '{next_s}' ({nb}) – {REFS['MACHINERY']}" if m_op else ''),
+            'Observed planting date' if obs_S else ('Recommended window only – no observed sowing date' if S else 'No sowing reference')])
 
     # ---- QC12: different crops in one tehsil must not share an identical stage + planting date without independent evidence
     mine = [x for x in T1_ROWS if x[5] == lgd]
-    # ---- v3.5 Dominant crop for Tabs 2-7 = the NAMED crop with the largest area this season (all its rows summed, e.g. standing +
-    #      newly transplanted + harvested paddy); its stage = the stage of that crop's largest row (confirmed or Option A estimate).
-    #      Never a placeholder: unnamed cropland is not a candidate; with no named crop the tehsil's crop mix names the crop.
-    UNNAMED = ('Active cropland – crop unknown', '—', 'Perennial / long-duration crops', 'Fallow – no active crop')
-    _unk = sum(x[12] or 0 for x in mine if x[7] == 'Active cropland – crop unknown')
+    # ---- v4.0 Dominant crop for Tabs 2-7 = the crop (or perennial group) with current-season evidence covering the largest area,
+    #      ONLY if it covers ≥ DOM_MIN_SHARE of active cropland; otherwise an explicit "not established" status (no prior-based names)
+    _act = max(area_bal['active'], 1)
     _agg = {}
     for x in mine:
-        if x[7] not in UNNAMED:
+        if x[9] in EVIDENCE_PRESENCE or x[7] == 'Perennial / plantation crops (type not separable)':
             _agg[x[7]] = _agg.get(x[7], 0) + (x[12] or 0)
-    _act = max(area_bal['active'], 1)
-    if _agg and max(_agg.values()) >= 1:
+    _unk = sum(x[12] or 0 for x in mine if x[7] == 'Active cropland – crop unknown')
+    _prior = next((x[68] for x in mine if x[7] == 'Active cropland – crop unknown'), '')
+    if _agg and max(_agg.values()) / _act >= DOM_MIN_SHARE:
         _crop, _a = max(_agg.items(), key=lambda kv: kv[1])
         _row = max((x for x in mine if x[7] == _crop), key=lambda x: x[12] or 0)
         DOM[lgd] = (_crop, _row[8], _row[23])
-        DOM_NOTE[lgd] = (f'Dominant crop = largest named crop this season: {_crop} {_a:,.0f} ha = {min(1, _a / _act):.0%} of active '
-                         f'cropland ({_row[9]}; {_row[25].split(":")[0]}); unattributed active cropland {_unk:,.0f} ha')
+        DOM_NOTE[lgd] = (f'Dominant crop = largest crop with current-season evidence: {_crop} {_a:,.0f} ha = {min(1, _a / _act):.0%} of '
+                         f'active cropland ({_row[9]}; stage: {_row[65]}); unidentified active cropland {_unk:,.0f} ha')
     elif area_bal['active'] < 1 and share >= 0.2:
         DOM[lgd] = ('Fallow – no active crop', mine[0][8] if mine else f'{SEASON} {SEASON_START.year}', 'Fallow – no active crop')
         DOM_NOTE[lgd] = 'No cropland pixel was green this season (Sentinel-2 max NDVI < 0.35)'
     else:
-        _mix = {k: v for k, v in mix_for(r).items() if k in SPAM_SEASON['Both'] or k in SPAM_SEASON.get(SEASON, set())
-                or k in SPAM_SEASON['Annual']}
-        if _mix:
-            _code = max(_mix, key=_mix.get)
-            _crop, _model = SPAM_NAMES.get(_code, _code), SPAM_TO_MODEL.get(_code)
-            _st = calendar_estimate(dict(presence='Probable crop identification', perennial=_code in SPAM_SEASON['Annual']),
-                                    _model, None, None, 0.2, None, '', None, ph_all, r, lgd)
-            if _model in CROP_MODELS:
-                _w = [(nm, w) for nm, w, _ in sow_windows(_model, r.state, lgd, TODAY)
-                      if w and w[0] <= TODAY and (TODAY - w[0]).days <= CROP_MODELS[_model]['harvest'][1]]
-                if _w:
-                    _nm, (_a1, _a2) = max(_w, key=lambda x: x[1][0])
-                    _st = calendar_estimate(dict(presence='Probable crop identification'), _model, CROP_MODELS[_model]['stages'],
-                                            _a1 + (_a2 - _a1) / 2, 0.2, CROP_MODELS[_model]['harvest'][1], _model.upper()[:6],
-                                            None, ph_all, r, lgd, f'{_nm} sowing window mid-point')
-            DOM[lgd] = (_crop, mine[0][8] if mine else f'{SEASON} {SEASON_START.year}', _st[0])
-            DOM_NOTE[lgd] = (f'No crop separable by satellite this season ({"cloud" if share < 0.2 else "unattributed cropland"}); '
-                             f'dominant crop = largest {SEASON}/all-season crop of the {MIX_NAME} mix ({mix_how(r)}); stage: {_st[6][:160]}')
-        else:
-            raise RuntimeError(f'Tehsil {lgd} ({r.tehsil}): no named crop and no crop-mix data – refusing to write a placeholder')
+        _top = max(_agg.items(), key=lambda kv: kv[1]) if _agg else None
+        DOM[lgd] = ('Not established – ' + (f'largest identified crop {_top[0]} covers only {_top[1] / _act:.0%} of active cropland'
+                                             if _top else 'no crop identified with current-season evidence'),
+                    mine[0][8] if mine else f'{SEASON} {SEASON_START.year}', U_IDENTITY)
+        DOM_NOTE[lgd] = (f'Dominant crop not established: identified crops cover < {DOM_MIN_SHARE:.0%} of active cropland '
+                         f'({_unk:,.0f} ha unidentified). {_prior}')
     seen = {}
     for x in mine:
-        if x[23] != UNC and 'estimate' not in x[23] and x[23] not in ('Fallow – no active crop', 'Standing perennial crop (no seasonal stage)'):
+        if x[23] != UNC and x[23] not in UNRESOLVED and x[23] != 'Fallow – no active crop':
             seen.setdefault((x[23], x[16]), []).append(x)
     for (stg, sd), xs in seen.items():
         if len({x[7] for x in xs}) > 1:
             for x in xs:
                 x[51] += '; QC12: identical stage and planting date as another crop in this tehsil – check independence'
 
-T1_BY_KIND = Counter('Stage not determined' if x[23] == UNC else 'calendar / curve estimate (Option A)' if 'estimate' in x[23] else
-                     'transition (2 consecutive stages)' if '(transition)' in x[23] else 'confirmed single stage' for x in T1_ROWS)
+T1_BY_KIND = Counter(x[65] for x in T1_ROWS)
 print(f'✅ Tab 1 rows: {len(T1_ROWS)} | Tab 8 rows: {len(T8_ROWS)} | ' + ' | '.join(f'{k}: {v}' for k, v in T1_BY_KIND.items()))
 
 
@@ -2347,7 +2551,17 @@ for i, lbl in enumerate(MONTH_LABELS):
     IDX_HEADER.append(f'{lbl} Value')
     if i > 0:
         IDX_HEADER.append(f'{lbl} MoM %')
-IDX_HEADER += ['QC Flags', 'Run ID']
+IDX_HEADER += ['QC Flags', 'Run ID', 'Latest MoM Δ (index points)', 'YoY Δ (index points)']   # v4.0 Δ columns appended
+
+def pct_idx(a, b):
+    """v4.0: % change of a vegetation index only when the baseline is positive and not near zero (≥ 0.05); NDWI / BSI are
+    usually negative, so their % changes are left empty – use the Δ (index-point) columns instead."""
+    if a is None or b is None or b < 0.05:
+        return None
+    return round((a - b) / b * 100, 1)
+
+def d_idx(a, b):
+    return None if (a is None or b is None) else round(a - b, 4)
 
 def trend_dir(vals, invert):
     a = [v for v in vals[-6:-3] if v is not None]
@@ -2378,32 +2592,102 @@ for idx in IDX6:
             qc.append(f'Not available: {", ".join(missing)}')
         if idx == 'BSI':
             qc.append('BSI: lower = more crop cover')
-        yoy = pct(vals[-1], vals[-13]) if (srcs[-1] == SAT and srcs[-13] == SAT) else None
+        yoy_ok = srcs[-1] == SAT and srcs[-13] == SAT
+        yoy = pct_idx(vals[-1], vals[-13]) if yoy_ok else None
         row = [r.state, r.slgd, r.district, r.dlgd, r.tehsil, r.lgd, dom[0], dom[1], dom[2],
-               MONTH_LABELS[-1], r4(vals[-1]), pct(vals[-1], vals[-2]), yoy,
+               MONTH_LABELS[-1], r4(vals[-1]), pct_idx(vals[-1], vals[-2]), yoy,
                r4(float(np.mean(okv))) if okv else None, r4(min(okv)) if okv else None, r4(max(okv)) if okv else None,
                trend_dir(vals, invert=(idx == 'BSI')), srcs.count(SAT)]
         for i, v in enumerate(vals):
             row.append(r4(v))
             if i > 0:
-                row.append(pct(v, vals[i - 1]))
+                row.append(pct_idx(v, vals[i - 1]))
             if srcs[i] == FILL:
                 colours.append((ri + 1, VAL_COL[i], FILL))
-        rows.append(row + ['; '.join(qc), RUN_ID])
+        if idx in ('NDWI', 'BSI'):
+            qc.append(f'{idx} is usually negative – % changes left empty; use the Δ (index-point) columns')
+        rows.append(row + ['; '.join(qc), RUN_ID, d_idx(vals[-1], vals[-2]), d_idx(vals[-1], vals[-13]) if yoy_ok else None])
     IDX_ROWS[idx], IDX_COLOURS[idx] = rows, colours
-# ---- v3.5 Phase 3 fill audit: Dominant Crop / Final Crop Stage must be real values in every row (run stops otherwise)
-BANNED = ('mixed / mostly unidentified', 'not identified', 'not applicable', 'insufficient data', 'crop unknown')
-_bad = [(rw[5], rw[6], rw[8]) for rw in IDX_ROWS['NDVI'] if not str(rw[6]).strip() or not str(rw[8]).strip()
-        or any(b in f'{rw[6]} {rw[8]}'.lower() for b in BANNED) or (CALENDAR_ESTIMATE and rw[8] == UNC)]
-_bad += [(rw[5], rw[7], rw[23]) for rw in T1_ROWS if not str(rw[23]).strip() or (CALENDAR_ESTIMATE and rw[23] == UNC)]
-if _bad:
-    raise RuntimeError(f'Fill audit failed for {len(_bad)} rows, e.g. {_bad[:5]}')
-_dk = Counter('confirmed' if ('estimate' not in d[2] and d[2] not in ('Fallow – no active crop',)) else
-              'fallow' if d[2] == 'Fallow – no active crop' else 'estimate' for d in DOM.values())
-print(f'✅ Fill audit passed – Dominant Crop and Final Crop Stage filled for all {len(DOM)} tehsils | dominant-crop stage: '
-      + ', '.join(f'{k} {v}' for k, v in _dk.items()))
-print('   Most common dominant crops:', Counter(d[0] for d in DOM.values()).most_common(10))
-_cells = 57 * (len(T1_ROWS) + 1) + 52 * (len(T8_ROWS) + 1) + 6 * len(IDX_HEADER) * (len(TEH) + 1)
+# ---- v4.0 acceptance tests on the REAL output (run stops before writing if any fails) + QC summary + stage report
+H1 = {h: k for k, h in enumerate(T1_HEADER)}
+GENERIC_LABELS = ('cropland curve estimate', 'season calendar estimate', 'calendar estimate)', 'steady green canopy')
+RICE_ONLY = {'Puddling and transplanting', 'Establishment (recovery)', 'Panicle initiation – booting', 'Heading / flowering',
+             'Grain filling – milk', 'Grain filling – dough', 'Physiological maturity – harvest-ready'}
+GRAIN_WORDS = ('grain', 'milk', 'dough', 'heading', 'silking', 'tassel', 'anthesis')
+def _base_stage(v):
+    return str(v).split(' (')[0].split(' →')[0]
+def _date_ok(v):
+    if v in ('', None):
+        return True
+    try:
+        d = dt.date.fromisoformat(str(v)[:10])
+    except ValueError:
+        return False
+    return dt.date(2014, 4, 3) <= d <= TODAY + dt.timedelta(days=400)
+ACCEPT = {}
+ACCEPT['T1 no epoch / out-of-range dates'] = [x[5] for x in T1_ROWS for k in (16, 17, 18, 26, 57, 58, 59, 60, 61) if not _date_ok(x[k])]
+ACCEPT['T2 no generic vegetation label as final stage'] = [x[5] for x in T1_ROWS if any(g in str(x[23]) for g in GENERIC_LABELS)] + \
+    [rw[5] for rw in IDX_ROWS['NDVI'] if any(g in str(rw[8]) for g in GENERIC_LABELS)]
+ACCEPT['T3 no rice stage on a non-rice crop'] = [x[5] for x in T1_ROWS if not str(x[7]).startswith('Rice') and _base_stage(x[23]) in RICE_ONLY]
+ACCEPT['T4 no grain-filling stage on perennial crops'] = [x[5] for x in T1_ROWS if ('Perennial' in str(x[7]) or 'Sugarcane' in str(x[7]))
+                                                         and any(w in str(x[23]).lower() for w in GRAIN_WORDS)]
+ACCEPT['T5 unidentified cropland has no crop-specific stage'] = [x[5] for x in T1_ROWS if x[9] in ('Active cropland, crop unknown',
+    'Candidate – flooded, no canopy rise yet', 'Insufficient data') and x[23] != U_IDENTITY]
+ACCEPT['T6 every record has a stage or explicit status'] = [x[5] for x in T1_ROWS if not str(x[23]).strip() or x[23] == UNC or
+                                                           not str(x[65]).strip()] + [rw[5] for rw in IDX_ROWS['NDVI'] if not str(rw[8]).strip()]
+ACCEPT['T7 no calendar-midpoint sowing date shown as actual'] = [x[5] for x in T1_ROWS if x[16] and 'Recommended sowing window only' in str(x[20])]
+ACCEPT['T8 identified area ≤ active cropland (no double counting)'] = [a['Tehsil LGD Code'] for a in AREA_ROWS
+    if a['Crop-specific identified ha'] > a['Active cultivated ha'] + max(1, 0.01 * a['Active cultivated ha'])]
+ACCEPT['T10 no % change on negative / near-zero index baselines'] = [rw[5] for idx in IDX6 for rw in IDX_ROWS[idx]
+    for k in range(len(MONTH_LABELS)) if k > 0 and rw[VAL_COL[k] + 1] is not None and (rw[VAL_COL[k - 1]] is None or rw[VAL_COL[k - 1]] < 0.05)]
+ACCEPT['T11 stage observation date ≤ latest acquisition date'] = [x[5] for x in T1_ROWS if x[26] and x[61] and str(x[26]) > str(x[61])]
+ACCEPT['T13 machinery only for a valid next operation'] = [x[5] for x in T8_ROWS if x[21] not in ('None', '') and not x[52]]
+_keys = [set(TEH.lgd), {x[5] for x in T1_ROWS}, {x[5] for x in T8_ROWS}] + [{rw[5] for rw in IDX_ROWS[i]} for i in IDX6]
+ACCEPT['T14 consistent geographic keys across sheets'] = sorted(set.union(*_keys) - set.intersection(*_keys))
+ACCEPT['T15 model version + source on every record'] = [x[5] for x in T1_ROWS if x[53] != MODEL_VERSION or not str(x[54]).strip()]
+for k_, v_ in ACCEPT.items():
+    print(('   ✅ ' if not v_ else '   ❌ ') + k_ + ('' if not v_ else f' – {len(v_)} failures, e.g. {sorted(set(map(str, v_)))[:5]}'))
+if any(ACCEPT.values()):
+    raise RuntimeError('Acceptance tests failed – nothing written. See ❌ lines above.')
+
+# QC summary + stage report (written as extra sheets of the Excel artifact and as stage_report.md)
+_T1 = pd.DataFrame(T1_ROWS, columns=T1_HEADER)
+def _vc(col, df=None):
+    v = (df if df is not None else _T1)[col].replace('', '(blank)').value_counts()
+    return pd.DataFrame({'Value': v.index, 'Rows': v.values, '% rows': (100 * v.values / max(1, v.sum())).round(1)})
+_cat = lambda v: ('Satellite-observed' if v.startswith('Satellite') else 'Model-inferred' if v.startswith('Model') else
+                  'Field-verified' if v.startswith('Field') else 'Unresolved')
+_T1['Stage evidence class'] = _T1['Stage Verification Status'].map(_cat)
+_cropland_rows = _T1[_T1['Crop Presence Status'] != 'No active crop detected']
+QC_SUMMARY = pd.concat([
+    pd.DataFrame([{'Section': 'Missing fields', 'Item': c, 'Value': int((_T1[c].astype(str).str.strip() == '').sum())}
+                  for c in ['Crop', 'Crop Season', 'Final Crop Stage', 'Stage Estimation Method', 'Model Version', 'Source', 'Processing Date']]),
+    pd.DataFrame([{'Section': 'Crop identification status', 'Item': k, 'Value': v} for k, v in _T1['Crop Presence Status'].value_counts().items()]),
+    pd.DataFrame([{'Section': 'Stage verification', 'Item': k, 'Value': v} for k, v in _T1['Stage Verification Status'].value_counts().items()]),
+    pd.DataFrame([{'Section': 'Satellite freshness', 'Item': k, 'Value': v} for k, v in _T1['Satellite Freshness'].value_counts().items()]),
+    pd.DataFrame([{'Section': 'Unresolved reasons', 'Item': k.split(' → ')[0], 'Value': v}
+                  for k, v in _T1['Stage Unresolved Reason / Next Action'].replace('', None).dropna().value_counts().items()]),
+    pd.DataFrame([{'Section': 'Area reconciliation failures', 'Item': a['Tehsil'], 'Value': a['Overlap check']}
+                  for a in AREA_ROWS if a['Overlap check'] != 'OK']),
+    pd.DataFrame([{'Section': 'Acceptance tests', 'Item': k, 'Value': 'PASS' if not v else f'FAIL ({len(v)})'} for k, v in ACCEPT.items()]),
+    pd.DataFrame([{'Section': 'Duplicate spatial IDs', 'Item': 'Tehsil LGD codes appearing twice in TEH', 'Value': int(TEH.lgd.duplicated().sum())}]),
+], ignore_index=True)
+STAGE_REPORT = {
+    'Crop × stage': _T1.groupby(['Crop', 'Final Crop Stage']).size().reset_index(name='Rows'),
+    'District × stage': _T1.groupby(['District', 'Crop', 'Final Crop Stage']).size().reset_index(name='Rows'),
+    'Stage evidence share': _vc('Stage evidence class'),
+    'Stage evidence share (area)': (_cropland_rows.groupby('Stage evidence class')['Estimated Crop Area Ha'].sum().round(0)
+                                    .reset_index(name='Area ha')),
+    'Stage confidence': _T1['Growth Stage Confidence'].replace('', np.nan).astype(float).describe().round(1).reset_index(),
+    'Crop ID confidence': _T1['Crop Identification Confidence'].replace('', np.nan).astype(float).describe().round(1).reset_index(),
+    'Latest observation': pd.DataFrame([{'Latest S2 acquisition (any tehsil)': max([d for d in _T1['Latest S2 Acquisition Date'] if d], default=''),
+                                         'Latest S1 acquisition (any tehsil)': max([d for d in _T1['Latest S1 Acquisition Date'] if d], default=''),
+                                         'Median days since usable observation': pd.to_numeric(_T1['Days Since Observation'], errors='coerce').median()}]),
+}
+_sh = _vc('Stage evidence class')
+print('📊 Stage evidence (rows): ' + ', '.join(f"{a} {b}%" for a, b in zip(_sh['Value'], _sh['% rows'])))
+print('   Dominant crops:', Counter(d[0] if not d[0].startswith('Not established') else 'Not established' for d in DOM.values()).most_common(8))
+_cells = len(T1_HEADER) * (len(T1_ROWS) + 1) + len(T8_HEADER) * (len(T8_ROWS) + 1) + 6 * len(IDX_HEADER) * (len(TEH) + 1)
 print(f'✅ Index tabs ready ({len(IDX_HEADER)} cols) | workbook ≈ {_cells / 1e6:.2f} M cells (Google Sheets limit 10 M)')
 
 
@@ -2460,9 +2744,10 @@ for ref in REFERENCE_AREAS:
                      'Estimate / reference': round(ratio, 2) if ratio else '', 'Verdict': verdict,
                      'Note': 'Partial coverage if the run is filtered to some states/districts' if STATE_FILTER else '',
                      **({f'Calibration {cs} ha': round(sum((fnum(SAT_MAPS.get(l, {}).get(f'rice_cal_{k}')) or 0) * GEO_AREA_HA.get(l, 0)
-                                                               for l in teh.lgd)) for k, cs in enumerate(RICE_CAL_SETS)} if RICE_CALIBRATE else {})})
-STAGE_KIND = Counter((x[7], 'single stage' if (x[23] != UNC and '(transition)' not in x[23]) else
-                      'transition' if x[23] != UNC else 'not determined') for x in T1_ROWS)
+                                                               for l in teh.lgd)) for k, cs in enumerate(RICE_CAL_SETS)} if RICE_CALIBRATE else {}),
+                     **({f'Calibration {cs} no water check ha': round(sum((fnum(SAT_MAPS.get(l, {}).get(f'rice_calnw_{k}')) or 0) *
+                         GEO_AREA_HA.get(l, 0) for l in teh.lgd)) for k, cs in enumerate(RICE_CAL_SETS)} if RICE_CALIBRATE else {})})
+STAGE_KIND = Counter((x[7], x[65]) for x in T1_ROWS)
 GATE = Counter(q.split(':')[0] for x in T1_ROWS for q in str(x[51]).split('; ') if 'stage rejected' in q)
 VAL_SUMMARY = pd.DataFrame([{'Crop': k[0], 'Stage result': k[1], 'Rows': v} for k, v in sorted(STAGE_KIND.items())])
 print('📏 Reference checks:')
@@ -2474,8 +2759,9 @@ if RICE_CALIBRATE:
     for rr in REF_ROWS:
         print(f"   {rr['Scope']} (reference {rr['Reference ha']:,} ha, {rr['Reference']}):")
         for k, cs in enumerate(RICE_CAL_SETS):
-            v = rr[f'Calibration {cs} ha']
-            print(f"      {cs}: {v:,} ha  = {v / rr['Reference ha']:.0%} of reference")
+            v = rr[f'Calibration {cs} ha']; v2 = rr.get(f'Calibration {cs} no water check ha', 0)
+            print(f"      {cs}: {v:,} ha = {v / rr['Reference ha']:.0%} of reference | without the optical water check: {v2:,} ha "
+                  f"= {v2 / rr['Reference ha']:.0%}")
 print('🚦 Publish gate rejections:', dict(GATE) or 'none')
 
 DATA_SOURCES = pd.DataFrame([
@@ -2488,8 +2774,10 @@ DATA_SOURCES = pd.DataFrame([
      'Earth Engine', 'Generic classes (crops / flooded vegetation), not crop types; cloud-limited', 'Current-season corroboration of rice pixels'),
     ('ESA WorldCereal', 'ESA', '2021 v100', '10 m', 'seasonal', '2021', 'Earth Engine', 'Historical 2021 map; wheat/barley not separable',
      'Historical maize / winter-cereal location (with current activity only)'),
-    ('IFPRI SPAM', 'IFPRI', '2020 V2r2', '~10 km', 'static', 'c. 2019-21', 'Harvard Dataverse (manual download)',
-     'Modelled allocation, coarse', 'Probable crop mix only'),
+    ('CROPGRIDS', 'Tang et al. 2024 (Sci. Data)', 'v1.07', '0.05° (~5.6 km)', 'static', 'c. 2020', 'HTTP (UC Davis mirror / figshare)',
+     'Modelled from statistics; minor crops spread thinly', 'PRIOR candidates only – never creates a crop row'),
+    ('IFPRI SPAM', 'IFPRI', '2020 V2r2', '~10 km', 'static', 'c. 2019-21', 'Harvard Dataverse (manual download, optional)',
+     'Modelled allocation, coarse', 'PRIOR candidates only (overrides CROPGRIDS if supplied)'),
     ('ERA5-Land daily', 'ECMWF / Copernicus', 'DAILY_AGGR', '11.1 km', 'daily (~5-day latency)', f'to {_era_last}', 'Earth Engine',
      'Reanalysis, not station data', 'Rainfall, air temperature, normals, GDD'),
     ('CHIRPS daily', 'UCSB-CHG', '2.0', '~5.5 km', 'daily (weeks latency)', f'to {_ch_last}', 'Earth Engine', 'Latency',
@@ -2570,6 +2858,19 @@ with pd.ExcelWriter(XLSX) as xw:
     VAL_SUMMARY.to_excel(xw, sheet_name='Validation', index=False, startrow=8 + len(REF_ROWS))
     pd.DataFrame([{'QC gate': k, 'Stages rejected': v} for k, v in GATE.items()]).to_excel(
         xw, sheet_name='Validation', index=False, startrow=12 + len(REF_ROWS) + len(VAL_SUMMARY))
+    QC_SUMMARY.to_excel(xw, sheet_name='QC_Summary', index=False)                       # v4.0
+    _r0 = 0
+    for _t, _df in STAGE_REPORT.items():
+        pd.DataFrame({_t: []}).to_excel(xw, sheet_name='Stage_Report', index=False, startrow=_r0)
+        _df.to_excel(xw, sheet_name='Stage_Report', index=False, startrow=_r0 + 1)
+        _r0 += len(_df) + 4
+    PHENO_DB.to_excel(xw, sheet_name='Crop_Phenology_DB', index=False)
+PHENO_DB.to_csv(f'{WORK_DIR}/crop_phenology_db.csv', index=False)
+with open(f'{WORK_DIR}/stage_report.md', 'w') as fh:
+    fh.write(f'# CropIntel stage report – {RUN_ID} ({MODEL_VERSION})\n\n')
+    for _t, _df in [('QC summary', QC_SUMMARY)] + list(STAGE_REPORT.items()):
+        fh.write(f'## {_t}\n\n' + _df.head(400).to_markdown(index=False) + '\n\n')
+print('💾 QC summary, stage report and phenology DB saved next to the workbook')
 print('💾 Excel copy saved:', XLSX, '(uploaded as a workflow artifact)')
 
 try:
