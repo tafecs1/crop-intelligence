@@ -112,6 +112,11 @@ jobs:
         with:
           path: work/ggcmi
           key: ggcmi-phase3-v1.01
+      - name: Restore CROPGRIDS crop-mix table (downloaded automatically on the first run)
+        uses: actions/cache@v4
+        with:
+          path: work/cropgrids
+          key: cropgrids-v1.07-india
       - run: python crop_intel.py
       - uses: actions/upload-artifact@v4
         if: always()

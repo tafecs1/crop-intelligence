@@ -60,6 +60,17 @@ RICE_CAL_SETS    = [(-20.0, -15.0, 3.0, 5.0), (-19.0, -14.0, 2.0, 4.0), (-18.0, 
 GGCMI_DIR        = f'{DRIVE_DIR}/ggcmi'   # GGCMI Phase 3 crop calendar (auto-downloaded from Zenodo, CC BY 4.0)
 GGCMI_URL        = 'https://zenodo.org/records/5062513/files/{f}?download=1'
 GGCMI_WINDOW_DAYS = 30                      # ± days around the GGCMI (multi-year average) planting day accepted as the sowing window
+# v3.5: CROPGRIDS 2020 (Tang et al. 2024, Scientific Data, CC BY 4.0) – 173 crops at 0.05° (~5.6 km); per-crop NetCDF files download
+#       automatically (no form, no login). Used to NAME the crops satellites cannot separate (replaces the manual APY/SPAM step).
+USE_CROPGRIDS   = True
+CROPGRIDS_DIR   = f'{DRIVE_DIR}/cropgrids'
+CROPGRIDS_URLS  = ['https://geodata.ucdavis.edu/geodata/crops/cropgrids/CROPGRIDSv1.07_{c}.nc']   # per-crop files (UC Davis mirror)
+CROPGRIDS_ZIP   = 'https://ndownloader.figshare.com/files/44950942'   # fallback: official figshare v1.08 zip (807 MB, all crops)
+OTHER_CURVE_SHARE = 0.60                    # a modelled crop that is ≥ this share of the tehsil's modelled seasonal crop area may use the
+                                            # measured curve of the remaining annual cropland (not rice / maize / winter cereal / perennial)
+CALENDAR_ESTIMATE = True                    # Option A: when evidence cannot confirm a stage, publish the crop-calendar stage labelled
+                                            # "(calendar estimate)" with a low confidence instead of "Stage not determined"
+STRICT_FILL     = True                      # stop the run (instead of writing placeholders) if no crop-mix source could be loaded
 # Official reference areas used ONLY to validate (never to set) satellite estimates. Add rows as figures are published.
 REFERENCE_AREAS = [
     dict(scope='Tamil Nadu (state)', state='Tamil Nadu', district=None, crop='Rice', what='2026-27 paddy area target, all seasons', ha=2_000_000, kind='upper_bound',
@@ -68,7 +79,7 @@ REFERENCE_AREAS = [
          date='2026-11-14', source='newkerala.com, 14-Nov-2026 – also reports crops "planted about a month ago"'),
 ]
 FIELD_OBS_CSV    = f'{INPUT_DIR}/field_observations.csv'  # OPTIONAL ground truth: tehsil_lgd,crop,stage,observation_date,planting_date
-MODEL_VERSION   = 'CropIntel-v3.4'
+MODEL_VERSION   = 'CropIntel-v3.5'
 RUN_DATE        = os.environ.get('RUN_DATE') or None   # set once per workflow run so all jobs share the same date
 
 
@@ -271,6 +282,10 @@ REFS = {
     'IMD_HEAVY': 'IMD rainfall intensity terminology: heavy rainfall ≥ 64.5 mm/day',
     'WORLDCEREAL': 'ESA WorldCereal 2021 10 m (Earth Engine ESA/WorldCereal/2021/MODELS/v100) – historical map, 2021 season',
     'WORLDCOVER': 'ESA WorldCover v200 (2021) 10 m',
+    'CROPGRIDS': 'CROPGRIDS v1.07/1.08 – Tang F.H.M. et al. (2024) Scientific Data 11:413, doi:10.1038/s41597-024-03247-7; 173 crops, '
+                 'harvested area circa 2020 at 0.05°, CC BY 4.0 (modelled from FAOSTAT 2020 + sub-national statistics + 27 gridded datasets)',
+    'INDIA_CAL': 'Broad all-India sowing windows of the kharif / rabi / summer seasons (DES Agricultural Statistics at a Glance, crop calendar of '
+                 'major crops; ICAR package of practices). Used ONLY when no TNAU or GGCMI window exists for the tehsil',
     'SPAM': 'IFPRI SPAM 2020 V2r2 harvested area, 5-arcmin (~10 km) modelled crop allocation, doi:10.7910/DVN/SWPENT',
     'ERA5': 'ECMWF ERA5-Land daily aggregates (ECMWF/ERA5_LAND/DAILY_AGGR), 11.1 km, reanalysis',
     'CHIRPS': 'UCSB-CHG CHIRPS daily rainfall, ~5.5 km',
@@ -417,6 +432,18 @@ TN_WINDOWS = {
     'Black gram': [('Adipattam', (6, 8)), ('Puratasipattam', (9, 11)), ('Rice fallow (Cauvery delta)', (1, 2))],
     'Green gram': [('Adipattam', (6, 7)), ('Rice fallow (Cauvery delta)', (1, 2))],
 }
+# v3.5 all-India fallback sowing windows (month numbers) – REFS['INDIA_CAL']; broad national windows, lowest calendar weight
+INDIA_WINDOWS = {
+    'Maize': [('India kharif', (6, 7)), ('India rabi', (10, 11)), ('India spring', (1, 2))],
+    'Groundnut': [('India kharif', (6, 7)), ('India rabi / summer', (11, 1))],
+    'Cotton': [('India irrigated (north)', (4, 5)), ('India rainfed (central / south)', (6, 7))],
+    'Black gram': [('India kharif', (6, 7)), ('India rabi', (10, 11))],
+    'Green gram': [('India kharif', (6, 7)), ('India summer', (3, 4))],
+    'Sugarcane': [('India spring planting', (2, 3)), ('India adsali', (7, 8)), ('India autumn planting', (10, 10))],
+    'Wheat': [('India rabi', (11, 12))],
+    'Rapeseed & Mustard': [('India rabi', (10, 11))],
+    'Chickpea': [('India rabi', (10, 11))],
+}
 MACHINERY_BY_BUCKET = {'Land Prep': 'Tillage', 'Sowing': 'Seeding / transplanting', 'Germination': 'None',
                        'Vegetative': 'Spraying', 'Flowering': 'Spraying', 'Grain Fill/Maturity': 'None', 'Harvest': 'Harvesting'}
 
@@ -549,7 +576,16 @@ def trend_image(region):
     rice = R['est']
     mz = WC_MAIZE.And(rice.Not()).And(R['recent'].Not())
     wcm = WC_WINTER.And(rice.Not()).And(R['recent'].Not()).And(mz.Not())
-    masks = {'': None, 'RICE': rice, 'MZ': mz, 'WC': wcm}
+    # v3.5 'OTH' = remaining ANNUAL cropland active this season (not paddy, maize map, winter-cereal map or perennially green):
+    #      the measured curve of the field crops that satellites cannot name (used only for a crop that dominates that area)
+    s2y = s2_collection(TODAY - dt.timedelta(days=365), TODAY + dt.timedelta(days=1), region).map(
+        lambda i: i.normalizedDifference(['B8', 'B4']).rename('NDVI'))
+    perennial = s2y.map(lambda i: i.gte(0.4)).mean().gte(0.85).And(s2y.count().gte(8)).unmask(0)
+    ndmax = (s2_collection(SEASON_START, TODAY + dt.timedelta(days=1), region)
+             .map(lambda i: i.normalizedDifference(['B8', 'B4']).rename('NDVI')).max())
+    oth = (ndmax.gte(0.35).unmask(0).And(CROPLAND).And(rice.Not()).And(R['recent'].Not()).And(R['harv'].Not())
+           .And(mz.Not()).And(wcm.Not()).And(perennial.Not()))
+    masks = {'': None, 'RICE': rice, 'MZ': mz, 'WC': wcm, 'OTH': oth}
     s1 = s1_collection(TREND_ENDS[0] - dt.timedelta(days=14), TODAY + dt.timedelta(days=1), region, ('VH',))
     bands = []
     for i, e in enumerate(TREND_ENDS):
@@ -875,7 +911,7 @@ for bi, codes in enumerate(_batches, 1):
         kind = f"M_{mg[0]:%Y%m}_{mg[-1]:%Y%m}" + (f'_{TODAY}' if CUR_MONTH in mg else '')
         for pr in safe_reduce(kind, codes, monthly_image_fn(mg)):
             SAT_MONTHLY.setdefault(norm_code(pr.get(LGD_F)), {}).update(pr)
-    for pr in safe_reduce(f'TREND5_{TODAY}_{RICE_SIG}', codes, trend_image):
+    for pr in safe_reduce(f'TREND6_{TODAY}_{RICE_SIG}', codes, trend_image):
         SAT_TREND[norm_code(pr.get(LGD_F))] = pr
     for pr in safe_reduce(f'CUR4_{TODAY}', codes, current_image, add_area=True):
         SAT_CUR[norm_code(pr.get(LGD_F))] = pr
@@ -941,8 +977,10 @@ def _bbox():
 def spam_cells():
     """India grid cells: x, y + harvested area (ha) per SPAM crop code (all technologies)."""
     cache = f'{CACHE_DIR}/spam2020_india_cells.csv'
-    if os.path.exists(cache):
-        return pd.read_csv(cache)
+    for _c in (cache, f'{globals().get("INPUT_DIR", WORK_DIR)}/spam2020_india_cells.csv', f'{WORK_DIR}/spam2020_india_cells.csv'):
+        if os.path.exists(_c):
+            print('Using SPAM India cells file:', _c)
+            return pd.read_csv(_c)
     local = sorted(glob.glob(f'{INPUT_DIR}/*harvested_area*.zip') + glob.glob(f'{WORK_DIR}/*harvested_area*.zip'))
     local_csv = [f for f in local if 'csv' in f.lower()]
     if local_csv or local:
@@ -1022,6 +1060,128 @@ if USE_SPAM:
         print('⚠️ SPAM not loaded – crops satellites cannot separate will show as "Other crops – not identified":', str(e)[:300])
 
 
+# ===== CELL 7b2: CROPGRIDS 2020 crop mix – automatic download, no form / login (v3.5) =====
+# 173 crops, harvested area circa 2020 at 0.05° (~5.6 km). Used ONLY to NAME crops that the satellite layers cannot separate,
+# and always labelled "Modelled (CROPGRIDS 2020)" – it is a statistical crop mix, not a current-season observation.
+import xarray as xr
+CG_CROPS = {  # CROPGRIDS file name → pipeline crop code (IFPRI SPAM codes where one exists)
+    'rice': 'rice', 'wheat': 'whea', 'maize': 'maiz', 'barley': 'barl', 'millet': 'mill', 'sorghum': 'sorg', 'potato': 'pota',
+    'sweetpotato': 'swpo', 'cassava': 'cass', 'yam': 'yams', 'bean': 'bean', 'chickpea': 'chic', 'cowpea': 'cowp', 'pigeonpea': 'pige',
+    'lentil': 'lent', 'pulsenes': 'opul', 'pea': 'peas', 'greenpea': 'peas', 'soybean': 'soyb', 'groundnut': 'grou', 'coconut': 'cnut',
+    'oilpalm': 'oilp', 'sunflower': 'sunf', 'rapeseed': 'rape', 'mustard': 'rape', 'sesame': 'sesa', 'castor': 'cast',
+    'safflower': 'saff', 'linseed': 'lins', 'sugarcane': 'sugc', 'cotton': 'cott', 'jute': 'jute', 'coffee': 'coff', 'tea': 'teas',
+    'tobacco': 'toba', 'banana': 'bana', 'plantain': 'plnt', 'mango': 'mang', 'cashew': 'cash', 'areca': 'arec', 'rubber': 'rubb',
+    'pepper': 'pepp', 'ginger': 'ging', 'spicenes': 'spic', 'chilleetc': 'chil', 'onion': 'onio', 'garlic': 'garl', 'tomato': 'toma',
+    'eggplant': 'brin', 'okra': 'okra', 'cauliflower': 'caul', 'cabbage': 'cabb', 'vegetablenes': 'vege', 'cucumberetc': 'vege',
+    'pumpkinetc': 'vege', 'orange': 'citr', 'lemonlime': 'citr', 'citrusnes': 'citr', 'grape': 'grap', 'papaya': 'papa',
+    'pineapple': 'pine', 'tropicalnes': 'trof', 'fruitnes': 'trof'}
+SPAM_NAMES.update({'mill': 'Millets (bajra / ragi / small millets)', 'peas': 'Peas', 'cast': 'Castor', 'saff': 'Safflower',
+    'lins': 'Linseed', 'jute': 'Jute', 'coff': 'Coffee', 'mang': 'Mango', 'cash': 'Cashew', 'arec': 'Arecanut', 'rubb': 'Rubber',
+    'pepp': 'Black pepper', 'ging': 'Ginger', 'spic': 'Spices (turmeric, coriander, cumin …)', 'chil': 'Chillies', 'onio': 'Onion',
+    'garl': 'Garlic', 'toma': 'Tomato', 'brin': 'Brinjal', 'okra': 'Okra (bhindi)', 'caul': 'Cauliflower', 'cabb': 'Cabbage',
+    'citr': 'Citrus', 'grap': 'Grapes', 'papa': 'Papaya', 'pine': 'Pineapple'})
+SPAM_SEASON['Rabi'] |= {'peas', 'saff', 'lins', 'garl', 'caul', 'cabb'}
+SPAM_SEASON['Kharif'] |= {'mill', 'cast', 'jute'}
+SPAM_SEASON['Both'] |= {'chil', 'onio', 'toma', 'brin', 'okra'}
+SPAM_SEASON['Annual'] |= {'coff', 'mang', 'cash', 'arec', 'rubb', 'pepp', 'ging', 'spic', 'citr', 'grap', 'papa', 'pine'}
+MIX_SRC, MIX_NAME, MIX_REF = 'Modelled (IFPRI SPAM 2020)', 'IFPRI SPAM 2020', 'SPAM'
+
+def _cg_file(c):
+    pth = f'{CROPGRIDS_DIR}/{c}.nc'
+    if os.path.exists(pth) and os.path.getsize(pth) > 10_000:
+        return pth
+    for u in CROPGRIDS_URLS:
+        for attempt in range(3):
+            try:
+                rq = requests.get(u.format(c=c), timeout=300, headers={'User-Agent': 'CropIntel/3.5 (+https://github.com/tafecs1/crop-intelligence)'})
+                if rq.status_code == 200 and rq.content[:4] in (b'\x89HDF', b'CDF\x01', b'CDF\x02'):
+                    open(pth, 'wb').write(rq.content)
+                    return pth
+            except Exception:
+                pass
+            time.sleep(5 * (attempt + 1))
+    return None
+
+def _cg_zip_fallback(missing):
+    """Official figshare zip (807 MB) – used only if the per-crop mirror failed; extracts just the missing crops."""
+    zp = f'{CROPGRIDS_DIR}/CROPGRIDS_NC_maps.zip'
+    if not os.path.exists(zp):
+        with requests.get(CROPGRIDS_ZIP, stream=True, timeout=1800, headers={'User-Agent': 'CropIntel/3.5'}) as r:
+            r.raise_for_status()
+            with open(zp, 'wb') as fh:
+                for chunk in r.iter_content(1 << 22):
+                    fh.write(chunk)
+    with zipfile.ZipFile(zp) as z:
+        for nm in z.namelist():
+            m = re.search(r'CROPGRIDSv[\d.]+_([a-z]+)\.nc$', nm)
+            if m and m.group(1) in missing:
+                open(f'{CROPGRIDS_DIR}/{m.group(1)}.nc', 'wb').write(z.read(nm))
+    os.remove(zp)
+
+def cropgrids_cells():
+    cache = f'{CROPGRIDS_DIR}/cropgrids_india_cells.csv'
+    if os.path.exists(cache):
+        return pd.read_csv(cache)
+    os.makedirs(CROPGRIDS_DIR, exist_ok=True)
+    got = {c: _cg_file(c) for c in CG_CROPS}
+    missing = [c for c, p in got.items() if not p]
+    if missing:
+        print(f'   CROPGRIDS mirror missing {len(missing)} crops – trying the official figshare zip …')
+        try:
+            _cg_zip_fallback(set(missing))
+        except Exception as e:
+            print('   figshare fallback failed:', str(e)[:200])
+        got = {c: (f'{CROPGRIDS_DIR}/{c}.nc' if os.path.exists(f'{CROPGRIDS_DIR}/{c}.nc') else None) for c in CG_CROPS}
+    ok = {c: p for c, p in got.items() if p}
+    assert ok.get('rice') and ok.get('wheat'), 'CROPGRIDS core files (rice, wheat) could not be downloaded'
+    grid, acc = None, {}
+    for c, p in ok.items():
+        with xr.open_dataset(p) as d:
+            v = 'harvarea' if 'harvarea' in d.data_vars else next(k for k in d.data_vars if 'harv' in k.lower())
+            la = next(k for k in d.coords if k.lower().startswith('lat'))
+            lo = next(k for k in d.coords if k.lower().startswith('lon'))
+            lat, lon = d[la].values, d[lo].values
+            iy, ix = np.where((lat >= 6) & (lat <= 38))[0], np.where((lon >= 68) & (lon <= 98))[0]
+            a = np.asarray(d[v].isel({la: iy, lo: ix}).squeeze().values, dtype=float)
+            if a.shape != (len(iy), len(ix)):
+                a = a.T
+            if grid is None:
+                grid = (lat[iy], lon[ix])
+        a[~np.isfinite(a) | (a < 0)] = 0
+        code = CG_CROPS[c]
+        acc[code] = acc[code] + a if code in acc else a
+    tot = sum(acc.values())
+    rr, cc = np.nonzero(tot > 0)
+    df = pd.DataFrame({'x': np.round(grid[1][cc], 4), 'y': np.round(grid[0][rr], 4), **{k: v[rr, cc] for k, v in acc.items()}})
+    df.to_csv(cache, index=False)
+    for p_ in ok.values():                      # the India table is all the pipeline needs – drop the global files
+        os.remove(p_)
+    print(f'CROPGRIDS India cells cached: {len(df):,} cells, {len(ok)} crop files')
+    return df
+
+if USE_CROPGRIDS and not SPAM_TEH:
+    try:
+        cells = cropgrids_cells()
+        x0, y0, x1, y1 = _bbox()
+        cells = cells[(cells.x >= x0) & (cells.x <= x1) & (cells.y >= y0) & (cells.y <= y1)].reset_index(drop=True)
+        _pts = gpd.GeoDataFrame({'cid': cells.index}, geometry=gpd.points_from_xy(cells.x, cells.y), crs=4326)
+        _j = gpd.sjoin(_pts, TEH_GDF, how='inner', predicate='within')
+        cells['lgd'] = cells.index.map(dict(zip(_j.cid, _j.lgd)))
+        codes = [c for c in cells.columns if c not in ('x', 'y', 'lgd')]
+        for lgd, row in cells.dropna(subset=['lgd']).groupby('lgd')[codes].sum().iterrows():
+            SPAM_TEH[lgd] = {c: float(v) for c, v in row.items() if v > 0}
+        MIX_SRC, MIX_NAME, MIX_REF = 'Modelled (CROPGRIDS 2020)', 'CROPGRIDS 2020', 'CROPGRIDS'
+        SPAM_INFO = 'CROPGRIDS 2020 harvested area (0.05° grid, modelled from FAOSTAT 2020 + sub-national statistics)'
+        _ri = sum(m.get('rice', 0) for m in SPAM_TEH.values()); _wh = sum(m.get('whea', 0) for m in SPAM_TEH.values())
+        print(f'✅ CROPGRIDS crop mix for {len(SPAM_TEH)} of {len(TEH)} tehsils (others use their district mix) | '
+              f'run-area totals: rice {_ri:,.0f} ha, wheat {_wh:,.0f} ha (all seasons, c. 2020)')
+    except Exception as e:
+        print('⚠️ CROPGRIDS not loaded:', str(e)[:300])
+if STRICT_FILL and not SPAM_TEH and globals().get('APY') is None:
+    raise RuntimeError('No crop-mix source loaded (CROPGRIDS download failed, no SPAM / APY file). Stopping instead of writing '
+                       'placeholder crop names – re-run the workflow; set STRICT_FILL = False to publish anyway.')
+
+
 # ===== CELL 7c: GGCMI Phase 3 crop calendar – all-India sowing windows & durations (auto-download, cached in Drive) =====
 # Static multi-year average planting / maturity day per 0.5° cell, irrigated (ir) and rainfed (rf). Used as CALENDAR EVIDENCE only
 # (like TNAU in Tamil Nadu): it never proves that a crop is present, and it is labelled in every row that uses it.
@@ -1080,7 +1240,10 @@ def sow_windows(model, state, lgd, ref):
     """Sowing windows: TNAU (Tamil Nadu, finer) else GGCMI (all India). Returns [(label, (start, end), duration or None)]."""
     if norm_state(state) == 'TAMIL NADU' and model in TN_WINDOWS:
         return [(f'TNAU {nm}', month_window_dates(mo, ref), None) for nm, mo in TN_WINDOWS[model]]
-    return [(w['label'], w['win'], w['dur']) for w in gg_windows(lgd, model, ref)]
+    out = [(w['label'], w['win'], w['dur']) for w in gg_windows(lgd, model, ref)]
+    if not out and model in INDIA_WINDOWS:        # v3.5: broad national window only when TNAU / GGCMI have nothing for this tehsil
+        out = [(f'{nm} (broad national window)', month_window_dates(mo, ref), None) for nm, mo in INDIA_WINDOWS[model]]
+    return out
 
 
 # ===== CELL 8: Monthly index series + Govt district crop areas =====
@@ -1382,6 +1545,24 @@ def model_for(name):
         return 'RICE'
     return None
 
+def mix_for(r):
+    """Crop mix (ha by crop code) for this tehsil: its own CROPGRIDS/SPAM cells, else district mix × cropland share,
+    else state mix × cropland share (tehsils smaller than one 5.6 km grid cell)."""
+    m = SPAM_TEH.get(r.lgd)
+    if m:
+        return m
+    cl = CL_HA.get(r.lgd, 0)
+    for key, mixes, cls in ((r.gkey, DIST_SPAM, DIST_CL), (STATE_OF.get(r.lgd), STATE_SPAM, STATE_CL)):
+        if mixes.get(key):
+            fac = cl / (cls.get(key) or cl or 1)
+            return {k: v * fac for k, v in mixes[key].items()}
+    return {}
+
+def mix_how(r):
+    if SPAM_TEH.get(r.lgd):
+        return f'{MIX_NAME} cells inside the tehsil'
+    return f'{MIX_NAME} ' + ('district' if DIST_SPAM.get(r.gkey) else 'state') + ' mix × tehsil cropland share'
+
 def crops_v3(r, geo_ha, cl_ha, mp, cur_share):
     """Crop rows with the 7 presence labels. Area totals are kept within active cropland (overlap prevention)."""
     out = []
@@ -1423,8 +1604,9 @@ def crops_v3(r, geo_ha, cl_ha, mp, cur_share):
     wc_note = ''
     wc_share = (f('wc_frac') or 0) * geo_ha / cl_ha if cl_ha else 0
     wc_spam = (SPAM_TEH.get(r.lgd) or {}).get('whea', 0) + (SPAM_TEH.get(r.lgd) or {}).get('barl', 0)
+    _mix_tot = sum((SPAM_TEH.get(r.lgd) or {}).values())
     wc_why = ('Govt APY reports wheat/barley in the district' if wc_govt > 0 else
-              f'SPAM 2020 shows {wc_spam:,.0f} ha wheat/barley' if wc_spam > 0 else None)
+              f'{MIX_NAME} shows {wc_spam:,.0f} ha wheat/barley' if wc_spam >= max(100, 0.05 * _mix_tot) else None)
     if wc_ha >= 1 and wc_why and SEASON == 'Rabi':
         out.append(dict(crop='Wheat (winter cereal – wheat/barley not separable by map)', group='Cereals', model='Wheat', trend='WC', area=wc_ha,
             src='Historical map (2021) + current activity', presence='Probable crop identification',
@@ -1435,14 +1617,23 @@ def crops_v3(r, geo_ha, cl_ha, mp, cur_share):
         wc_note = (f'; includes {wc_ha:,.0f} ha that the 2021 WorldCereal map labels winter cereals – NOT reported as wheat/barley: '
                    'no current-season or Govt evidence (old map ≠ current crop)')
     if per_ha >= 1:
-        mix = SPAM_TEH.get(r.lgd) or {}
-        perennial_alts = sorted([(SPAM_NAMES.get(k, k), v) for k, v in mix.items() if k in SPAM_SEASON['Annual']], key=lambda x: -x[1])[:5]
-        out.append(dict(crop='Perennial / long-duration crops (not separable)', group='Perennial crops', model=None, trend=None, area=per_ha,
-            src='Satellite (12-month greenness)', presence='Crop group identified, exact crop unknown',
-            method='Cropland green (NDVI ≥ 0.4) in ≥ 85 % of clear months over 12 months; sugarcane cannot be separated from banana, '
-                   'coconut, orchards or fodder with this evidence',
-            alts=', '.join(f'{n} (SPAM {v:,.0f} ha)' for n, v in perennial_alts) or 'Sugarcane, banana, coconut, orchards, fodder',
-            ev=f'{per_ha:,.0f} ha of perennially green cropland pixels'))
+        mix = mix_for(r)
+        perennial_alts = sorted([(SPAM_NAMES.get(k, k), v, k) for k, v in mix.items() if k in SPAM_SEASON['Annual']], key=lambda x: -x[1])[:5]
+        if perennial_alts:     # v3.5: named after the largest perennial crop of the crop mix; the satellite only proves "perennial"
+            p_name, p_ha, p_code = perennial_alts[0]
+            p_share = p_ha / sum(v for _, v, _ in perennial_alts)
+            out.append(dict(crop=p_name, group='Perennial crops', model=SPAM_TO_MODEL.get(p_code), trend=None, area=per_ha,
+                src='Satellite (12-month greenness)', presence='Probable crop identification', perennial=True,
+                method=(f'Cropland green (NDVI ≥ 0.4) in ≥ 85 % of clear months over 12 months (satellite: perennial / long-duration crop); '
+                        f'named {p_name} = largest perennial crop in the {MIX_NAME} crop mix ({p_share:.0%} of its perennial area) – '
+                        'the satellite cannot separate sugarcane, banana, coconut or orchards'),
+                alts=', '.join(f'{n} ({MIX_NAME} {v:,.0f} ha)' for n, v, _ in perennial_alts[1:]) or '—',
+                ev=f'{per_ha:,.0f} ha of perennially green cropland pixels'))
+        else:
+            out.append(dict(crop='Perennial / long-duration crops', group='Perennial crops', model=None, trend=None, area=per_ha,
+                src='Satellite (12-month greenness)', presence='Crop group identified, exact crop unknown', perennial=True,
+                method='Cropland green (NDVI ≥ 0.4) in ≥ 85 % of clear months over 12 months; no crop-mix data for this tehsil',
+                alts='Sugarcane, banana, coconut, orchards, fodder', ev=f'{per_ha:,.0f} ha of perennially green cropland pixels'))
     identified = sum(c['area'] for c in out)
     room = max(0.0, active_ha - identified)
     gl = gl_all
@@ -1458,10 +1649,8 @@ def crops_v3(r, geo_ha, cl_ha, mp, cur_share):
                 method=f"DES district APY (avg {g['years']}) apportioned by cropland share; not a current-season observation",
                 alts='—', ev=f"District {g['crop']} {g['area']:,.0f} ha × tehsil cropland share", darea=g['area']))
     else:
-        mix, how = SPAM_TEH.get(r.lgd), 'SPAM cells inside the tehsil'
-        if not mix and DIST_SPAM.get(r.gkey):
-            fac = cl_ha / (DIST_CL.get(r.gkey) or cl_ha)
-            mix, how = {k: v * fac for k, v in DIST_SPAM[r.gkey].items()}, 'district SPAM × tehsil cropland share'
+        mix = mix_for(r)
+        how = mix_how(r)
         for code, a in (mix or {}).items():
             name = SPAM_NAMES.get(code, f'SPAM crop {code.upper()}')
             if code in SPAM_SEASON['Annual'] or sat_group(name) in ('RICE', 'MZ', 'WC'):
@@ -1469,11 +1658,18 @@ def crops_v3(r, geo_ha, cl_ha, mp, cur_share):
             if not (code in SPAM_SEASON['Both'] or code in SPAM_SEASON.get(SEASON, set())):
                 continue
             extra.append(dict(crop=name, group='Modelled crop mix', model=SPAM_TO_MODEL.get(code), trend=None, area=a,
-                src='Modelled (IFPRI SPAM 2020)', presence='Probable crop identification',
-                method="IFPRI SPAM 2020 modelled crop mix (~10 km, from crop statistics c. 2019-21); season by crop type; "
+                src=MIX_SRC, presence='Probable crop identification',
+                method=f"{MIX_NAME} modelled crop mix (from crop statistics c. 2020); season by crop type; "
                        "NOT a current-season observation", alts='Other crops of the same season',
-                ev=f'{a:,.0f} ha SPAM harvested area ({how})' + ('; all-season total' if code in SPAM_SEASON['Both'] else '')))
+                ev=f'{a:,.0f} ha {MIX_NAME} harvested area ({how})' + ('; all-season total' if code in SPAM_SEASON['Both'] else '')))
     tot = sum(c['area'] for c in extra)
+    # v3.5 Phase 2: a crop that dominates the unexplained annual cropland uses that area's MEASURED curve ('OTH' pixels)
+    if tot > 0:
+        top = max(extra, key=lambda c: c['area'])
+        if top['area'] / tot >= OTHER_CURVE_SHARE and top['model'] in CROP_MODELS:
+            top['trend'] = 'OTH'
+            top['method'] += (f'; stage evidence = measured Sentinel-2 curve of the remaining annual cropland (not paddy / maize / '
+                              f'winter-cereal / perennial pixels), where {top["crop"]} is {top["area"] / tot:.0%} of the modelled seasonal area')
     for c in extra:
         if tot > room:
             c['area'] = c['area'] * room / tot if tot else 0
@@ -1484,10 +1680,11 @@ def crops_v3(r, geo_ha, cl_ha, mp, cur_share):
         out.append(dict(crop='Active cropland – crop unknown', group='Unidentified', model=None, trend=None, area=unknown,
             src='Satellite (current season)', presence='Active cropland, crop unknown',
             method='Cropland green this season (NDVI ≥ 0.35) not explained by identified crops' + (
-                '' if (GOVT_AREA or SPAM_TEH) else ' – no Govt APY file and SPAM not loaded, so non-rice field crops cannot be named'),
+                '' if (GOVT_AREA or SPAM_TEH) else ' – no crop-mix source loaded'),
             alts='Groundnut, pulses, millets, cotton, vegetables, maize …', ev=f'{unknown:,.0f} ha active cropland not attributed to any crop' + wc_note))
     if not out:
-        out.append(dict(crop='—', group='—', model=None, trend=None, area=0.0, src='Satellite (current season)',
+        out.append(dict(crop='Fallow – no active crop' if cur_share >= 0.2 else '—', group='—', model=None, trend=None, area=0.0,
+            src='Satellite (current season)',
             presence='No active crop detected' if cur_share >= 0.2 else 'Insufficient data',
             method='No cropland pixel was green this season' if cur_share >= 0.2 else 'Too few clear observations', alts='—', ev='—'))
     for c in out:
@@ -1506,16 +1703,78 @@ CL_HA = {lgd: (fnum(SAT_CUR.get(lgd, {}).get('crop_share')) or 0) * GEO_AREA_HA.
 DIST_CL, _GK = {}, dict(zip(TEH.lgd, TEH.gkey))
 for lgd, v in CL_HA.items():
     DIST_CL[_GK[lgd]] = DIST_CL.get(_GK[lgd], 0) + v
-DIST_SPAM = {}
+DIST_SPAM, STATE_SPAM, STATE_CL = {}, {}, {}
+for lgd, v in CL_HA.items():
+    STATE_CL[STATE_OF[lgd]] = STATE_CL.get(STATE_OF[lgd], 0) + v
 for lgd, mix in SPAM_TEH.items():
     k = _GK.get(lgd)
     if k is not None:
         for code, a in mix.items():
             DIST_SPAM.setdefault(k, {})[code] = DIST_SPAM.get(k, {}).get(code, 0) + a
+    for code, a in mix.items():
+        STATE_SPAM.setdefault(STATE_OF[lgd], {})[code] = STATE_SPAM.get(STATE_OF[lgd], {}).get(code, 0) + a
 _dup_names = TEH.groupby(['dkey', 'tehsil']).lgd.transform('count')
 DUP_NAME = dict(zip(TEH.lgd, _dup_names > 1))
 
-T1_ROWS, T8_ROWS, DOM, AREA_ROWS = [], [], {}, []
+EST_SOURCE = {'calendar': 'Calendar estimate (Option A): planting date + published crop stage durations – NOT confirmed by satellite',
+              'curve': 'Cropland-curve estimate (Option A): measured S2 curve phase mapped to a generic stage – no crop-specific model',
+              'season': 'Season-calendar estimate (Option A): days since season start – no clear satellite curve',
+              'perennial': 'Satellite: perennially green for 12 months (standing perennial crop)',
+              'fallow': 'Satellite: no cropland green this season'}
+GENERIC_BY_PHASE = {'pre': 'Land Prep / Sowing', 'rising': 'Vegetative', 'peak': 'Flowering', 'declining': 'Grain Fill/Maturity',
+                    'post': 'Harvest / post-harvest', 'flat': 'Vegetative (steady green canopy)'}
+
+def stage_index_at(table, dap):
+    """Index of the stage whose (mid) start day is the last one ≤ days-after-planting."""
+    cur = None
+    for k, t in enumerate(table):
+        st = t[1]
+        if dap >= ((st[0] + st[1]) / 2 if isinstance(st, tuple) else st):
+            cur = k
+    return 0 if cur is None else cur
+
+def calendar_estimate(c, model, table, S, s_w, dur_hi, prefix, ph, ph_all, r, lgd, s_txt=''):
+    """Option A. Returns (stage text, code, kind, confidence, next stage, next window, explanation). Always returns a stage."""
+    lab = ' (calendar estimate)'
+    if c.get('presence') == 'No active crop detected':
+        return 'Fallow – no active crop', 'FALLOW', 'fallow', 50, '— (next sowing)', None, 'no cropland pixel green this season'
+    if table and S:
+        dap = (TODAY - S).days
+        src_txt = s_txt or f'planting ~{S:%d-%b-%Y}'
+        if dap < 0:
+            return ('Land Prep' + lab, f'{prefix}-S00-EST', 'calendar', 20, table[0][0], None,
+                    f'{src_txt} is ahead – field preparation expected')
+        if dur_hi and dap > dur_hi + 15:
+            return ('Harvested / post-harvest' + lab, f'{prefix}-HARV-EST', 'calendar', 25, '— (next crop / fallow)', None,
+                    f'{dap} days since {src_txt} exceeds the crop duration ({dur_hi} d)')
+        k = stage_index_at(table, dap)
+        nxt = table[k + 1][0] if k + 1 < len(table) else '— (crop cycle complete)'
+        st = table[k + 1][1] if k + 1 < len(table) else None
+        nd = ((S + dt.timedelta(days=st[0]), S + dt.timedelta(days=st[1])) if isinstance(st, tuple) else
+              (S + dt.timedelta(days=st), S + dt.timedelta(days=st))) if st is not None else None
+        conf = int(min(45, round(15 + 35 * s_w)))
+        return (table[k][0] + lab, f'{prefix}-S{k + 1:02d}-EST', 'calendar', conf, nxt, nd,
+                f'{dap} days after {src_txt} → {table[k][0]} by the published {model} stage durations; satellite evidence could not '
+                'confirm it, so it is published as a calendar estimate')
+    if model in CROP_MODELS:                                 # crop with a stage model but no sowing window open now
+        table = CROP_MODELS[model]['stages']
+        wins = [w for _, w, _ in sow_windows(model, r.state, lgd, TODAY + dt.timedelta(days=60)) if w and w[0] > TODAY]
+        nxt_w = min(wins, key=lambda w: w[0]) if wins else None
+        return ('Land Prep' + lab, f'{model.upper().replace(" ", "")[:6]}-S00-EST', 'calendar', 15, table[0][0], nxt_w,
+                f'no {model} sowing window is open now' + (f'; next window opens {nxt_w[0]:%d-%b-%Y}' if nxt_w else ''))
+    if c.get('perennial'):
+        return ('Standing perennial crop (no seasonal stage)', 'PERENNIAL', 'perennial', 50, '—', None,
+                'perennially green for 12 months – perennial crops have no seasonal stage sequence')
+    pp = ph if (ph and ph.get('phase')) else (ph_all if ph_all and ph_all.get('phase') else None)
+    if pp:
+        return (GENERIC_BY_PHASE[pp['phase']] + ' (cropland curve estimate)', f"GEN-{pp['phase'].upper()}-EST", 'curve', 25, '—', None,
+                f"generic stage from the measured {'crop-pixel' if pp is ph else 'tehsil cropland'} curve: {PHASES[pp['phase']]}")
+    d = (TODAY - SEASON_START).days
+    g = ('Sowing' if d < 25 else 'Vegetative' if d < 70 else 'Flowering' if d < 95 else 'Grain Fill/Maturity' if d < 125 else 'Harvest')
+    return (g + ' (season calendar estimate)', 'GEN-SEASON-EST', 'season', 10, '—', None,
+            f'{d} days since the {SEASON} season start ({SEASON_START:%d-%b}); no clear satellite curve – lowest confidence')
+
+T1_ROWS, T8_ROWS, DOM, DOM_NOTE, AREA_ROWS = [], [], {}, {}, []
 for r in TEH.itertuples():
     lgd = r.lgd
     geo_ha, cl_ha = GEO_AREA_HA.get(lgd, 0), CL_HA.get(lgd, 0)
@@ -1736,6 +1995,10 @@ for r in TEH.itertuples():
         elif not table:
             stage_note = ('crop not resolved to a species with a sourced stage model' if c['group'] != 'Unidentified'
                           else 'crop unknown') + ' – stage not estimated'
+        if c.get('trend') == 'OTH' and final != UNC:
+            f_stage = min(f_stage, 0.6)
+            unc_notes.append('stage read from the curve of all remaining annual cropland, where this crop dominates the modelled mix – '
+                             'conditional on the crop identity')
         if model in ('Maize', 'Wheat') and final != UNC and 'Historical' in c['src']:
             f_stage = min(f_stage, 0.6)
             unc_notes.append(f'{model.lower()} identity is from a 2021 map + current activity (not verified this season) – stage is conditional on the crop')
@@ -1867,18 +2130,42 @@ for r in TEH.itertuples():
             final, code, stage_conf, prev_s, next_s, next_date, stage_win = UNC, 'NOT-DETERMINED', 0, '', '', None, None
             reason += ' | Publish gate: ' + '; '.join(reject) + ' → Stage not determined'
             est_stage = est_stage.split(' | current stage window')[0]
+        # ---- v3.5 Option A: never leave the stage empty – publish the crop-calendar stage, clearly labelled, with a low confidence
+        est_kind = None
+        if CALENDAR_ESTIMATE and final == UNC and not field:
+            S_est, s_est_txt = S, ''
+            if model in ('RICE', 'RICE_RECENT') and not table:      # paddy without one transplanting date: use the mean flood date
+                ft_mean = fnum(mp.get('rice_flood_t' if model == 'RICE' else 'rice_recent_t'))
+                if ft_mean is not None:
+                    S_est = S1_START + dt.timedelta(days=int(ft_mean))
+                    s_est_txt = f'mean Sentinel-1 flooding (puddling) date of the paddy pixels ~{S_est:%d-%b-%Y}'
+                    _sn, rc_ = rice_context(S_est, r.state, lgd)
+                    F_lo, F_hi = rice_field_duration(rc_)
+                    t_lo, t_hi = rice_stage_table(F_lo), rice_stage_table(F_hi)
+                    table = [(n, (a_, b_), bk, al) for (n, a_, bk, al), (_, b_, _, _) in zip(t_lo, t_hi)]
+                    prefix = 'RICE'
+            dur_hi = ((F_hi if prefix == 'RICE' else CROP_MODELS.get(model, {}).get('harvest', (0, 0))[1]) if table else None)
+            final, code, est_kind, stage_conf, next_s, next_date, est_why = calendar_estimate(
+                c, model, table, S_est, s_w if S else 0.3, dur_hi, prefix, ph, ph_all, r, lgd, s_est_txt)
+            names_t = [t[0] for t in table] if table else names_t
+            reason += f' | Option A – {est_why}'
+            if est_kind == 'calendar':
+                qc.append('QC17: stage is a CALENDAR ESTIMATE (not confirmed by satellite evidence) – low confidence')
+            elif est_kind == 'curve':
+                qc.append('QC17: stage is a generic CROPLAND-CURVE ESTIMATE (no crop-specific stage model) – low confidence')
         dq_status = 'Good' if (share >= 0.5 and ph and ph['n'] >= 8) else ('Fair' if share >= 0.2 else 'Poor')
         qc.insert(0, f'Data quality: {dq_status}')
 
         area_conf = {'Satellite (current season)': 75, 'Historical map (2021) + current activity': 45, 'Satellite (12-month greenness)': 55,
-                     'Modelled (IFPRI SPAM 2020)': 25, 'Govt district statistics (apportioned)': 40}.get(c['src'], 30)
+                     'Modelled (IFPRI SPAM 2020)': 25, 'Modelled (CROPGRIDS 2020)': 25,
+                     'Govt district statistics (apportioned)': 40}.get(c['src'], 30)
         confs = [x for x in (id_conf, stage_conf, sow_conf, area_conf) if isinstance(x, (int, float))]
         overall = round(np.mean(confs)) if confs else ''
         evid = (f'CropID {id_conf} | Stage {stage_conf} | Sowing {sow_conf or 0} | Harvest {harv_conf or 0} | Area {area_conf} | '
                 f'Health {health_conf} | Weather {wx_conf} — {PROVISIONAL}. Overall = mean(CropID, Stage, Sowing, Area).')
         refs = ['LGD', 'WORLDCOVER', 'S2', 'S1', 'ERA5'] + (['S1_RICE', 'TNAU_RICE_SEASONS', 'TNAU_RICE_NURSERY', 'RICE_PHASES', 'RICE_MILK_DOUGH']
                if model == 'RICE' else [CROP_MODELS[model]['ref'], 'TN_SEASONS_OTHER'] if model in CROP_MODELS else []) + \
-               (['WORLDCEREAL'] if 'Historical' in c['src'] else []) + (['SPAM'] if 'SPAM' in c['src'] else []) + \
+               (['WORLDCEREAL'] if 'Historical' in c['src'] else []) + ([MIX_REF] if c['src'] == MIX_SRC or c.get('perennial') else []) + \
                (['GDD_BASE'] if gdd is not None else []) + (['IMD_HEAVY'] if heavy is not None else [])
         source = ' || '.join(REFS[k] for k in dict.fromkeys(refs))
         insight = (f"{c['crop']}: {final if final != UNC else 'stage uncertain'}"
@@ -1902,7 +2189,7 @@ for r in TEH.itertuples():
             f"rubric score, NOT a probability", id_conf,
             round(c['area'], 1), round(cl_ha, 1), (round(c['darea'], 1) if c['darea'] else ''), f"{c['ev']} [{c['src']}] || {area_text}",
             ds(S), ds(e1), ds(e2), sow_conf, sow_ev,
-            sat_stage, est_stage, final, code, ('Field observation' if field and f_stage == 1.0 else
+            sat_stage, est_stage, final, code, (EST_SOURCE[est_kind] if est_kind else 'Field observation' if field and f_stage == 1.0 else
                 ('Sentinel-1 transplanting date + TNAU/IRRI rice stage durations + S2 NDVI/EVI and S1 VH curves of paddy pixels'
                  if prefix == 'RICE' and model == 'RICE' else
                  'Sentinel-1 recent flooding + TNAU rice calendar' if model == 'RICE_RECENT' else
@@ -1919,8 +2206,6 @@ for r in TEH.itertuples():
                               f"last S1 ≈ {ds(s1_last_d) or 'none'} | latest optical composite {TREND_ENDS[-1] - dt.timedelta(days=14)} to "
                               f"{TREND_ENDS[-1]}"), 'Field verified' if field else 'Not field-verified',
             geo_val, evid, '; '.join(qc), overall, MODEL_VERSION, source, ds(TODAY), RUN_ID])
-        if ci == 0:
-            DOM[lgd] = (c['crop'], season_lbl, final)
 
         # ---- Tab 8: ideal windows from TNAU calendar + published stage durations (fallback: tehsil satellite history)
         ideal_src, ideal_conf, w_sow, dur_txt, ideal_h, nursery_mid = NA, '', None, '', None, 0
@@ -1997,17 +2282,57 @@ for r in TEH.itertuples():
 
     # ---- QC12: different crops in one tehsil must not share an identical stage + planting date without independent evidence
     mine = [x for x in T1_ROWS if x[5] == lgd]
+    # ---- v3.5 Dominant crop for Tabs 2-7 = the NAMED crop with the largest area this season (all its rows summed, e.g. standing +
+    #      newly transplanted + harvested paddy); its stage = the stage of that crop's largest row (confirmed or Option A estimate).
+    #      Never a placeholder: unnamed cropland is not a candidate; with no named crop the tehsil's crop mix names the crop.
+    UNNAMED = ('Active cropland – crop unknown', '—', 'Perennial / long-duration crops', 'Fallow – no active crop')
+    _unk = sum(x[12] or 0 for x in mine if x[7] == 'Active cropland – crop unknown')
+    _agg = {}
+    for x in mine:
+        if x[7] not in UNNAMED:
+            _agg[x[7]] = _agg.get(x[7], 0) + (x[12] or 0)
+    _act = max(area_bal['active'], 1)
+    if _agg and max(_agg.values()) >= 1:
+        _crop, _a = max(_agg.items(), key=lambda kv: kv[1])
+        _row = max((x for x in mine if x[7] == _crop), key=lambda x: x[12] or 0)
+        DOM[lgd] = (_crop, _row[8], _row[23])
+        DOM_NOTE[lgd] = (f'Dominant crop = largest named crop this season: {_crop} {_a:,.0f} ha = {min(1, _a / _act):.0%} of active '
+                         f'cropland ({_row[9]}; {_row[25].split(":")[0]}); unattributed active cropland {_unk:,.0f} ha')
+    elif area_bal['active'] < 1 and share >= 0.2:
+        DOM[lgd] = ('Fallow – no active crop', mine[0][8] if mine else f'{SEASON} {SEASON_START.year}', 'Fallow – no active crop')
+        DOM_NOTE[lgd] = 'No cropland pixel was green this season (Sentinel-2 max NDVI < 0.35)'
+    else:
+        _mix = {k: v for k, v in mix_for(r).items() if k in SPAM_SEASON['Both'] or k in SPAM_SEASON.get(SEASON, set())
+                or k in SPAM_SEASON['Annual']}
+        if _mix:
+            _code = max(_mix, key=_mix.get)
+            _crop, _model = SPAM_NAMES.get(_code, _code), SPAM_TO_MODEL.get(_code)
+            _st = calendar_estimate(dict(presence='Probable crop identification', perennial=_code in SPAM_SEASON['Annual']),
+                                    _model, None, None, 0.2, None, '', None, ph_all, r, lgd)
+            if _model in CROP_MODELS:
+                _w = [(nm, w) for nm, w, _ in sow_windows(_model, r.state, lgd, TODAY)
+                      if w and w[0] <= TODAY and (TODAY - w[0]).days <= CROP_MODELS[_model]['harvest'][1]]
+                if _w:
+                    _nm, (_a1, _a2) = max(_w, key=lambda x: x[1][0])
+                    _st = calendar_estimate(dict(presence='Probable crop identification'), _model, CROP_MODELS[_model]['stages'],
+                                            _a1 + (_a2 - _a1) / 2, 0.2, CROP_MODELS[_model]['harvest'][1], _model.upper()[:6],
+                                            None, ph_all, r, lgd, f'{_nm} sowing window mid-point')
+            DOM[lgd] = (_crop, mine[0][8] if mine else f'{SEASON} {SEASON_START.year}', _st[0])
+            DOM_NOTE[lgd] = (f'No crop separable by satellite this season ({"cloud" if share < 0.2 else "unattributed cropland"}); '
+                             f'dominant crop = largest {SEASON}/all-season crop of the {MIX_NAME} mix ({mix_how(r)}); stage: {_st[6][:160]}')
+        else:
+            raise RuntimeError(f'Tehsil {lgd} ({r.tehsil}): no named crop and no crop-mix data – refusing to write a placeholder')
     seen = {}
     for x in mine:
-        if x[23] != UNC:
+        if x[23] != UNC and 'estimate' not in x[23] and x[23] not in ('Fallow – no active crop', 'Standing perennial crop (no seasonal stage)'):
             seen.setdefault((x[23], x[16]), []).append(x)
     for (stg, sd), xs in seen.items():
         if len({x[7] for x in xs}) > 1:
             for x in xs:
                 x[51] += '; QC12: identical stage and planting date as another crop in this tehsil – check independence'
 
-T1_BY_KIND = Counter('single stage' if (x[23] != UNC and '(transition)' not in x[23]) else
-                     'transition (2 consecutive stages)' if x[23] != UNC else 'Stage not determined' for x in T1_ROWS)
+T1_BY_KIND = Counter('Stage not determined' if x[23] == UNC else 'calendar / curve estimate (Option A)' if 'estimate' in x[23] else
+                     'transition (2 consecutive stages)' if '(transition)' in x[23] else 'confirmed single stage' for x in T1_ROWS)
 print(f'✅ Tab 1 rows: {len(T1_ROWS)} | Tab 8 rows: {len(T8_ROWS)} | ' + ' | '.join(f'{k}: {v}' for k, v in T1_BY_KIND.items()))
 
 
@@ -2038,11 +2363,13 @@ for idx in IDX6:
     rows, colours = [], []
     for ri, r in enumerate(TEH.itertuples()):
         vals, srcs = SERIES[idx][r.lgd]
-        dom = DOM.get(r.lgd, ('', '', ''))
+        dom = DOM[r.lgd]
         okv = [v for v, s_ in zip(vals, srcs) if v is not None]
         filled = [MONTH_LABELS[i] for i, s_ in enumerate(srcs) if s_ == FILL]
         missing = [MONTH_LABELS[i] for i, v in enumerate(vals) if v is None]
         qc = [f'{MONTH_LABELS[-1]} partial (to {TODAY:%d-%b})', 'tehsil cropland mean (not crop-specific)']
+        if DOM_NOTE.get(r.lgd):
+            qc.append(DOM_NOTE[r.lgd])
         if CL_HA.get(r.lgd, 0) < 1:
             qc.append('No cropland (WorldCover)')
         if filled:
@@ -2064,6 +2391,18 @@ for idx in IDX6:
                 colours.append((ri + 1, VAL_COL[i], FILL))
         rows.append(row + ['; '.join(qc), RUN_ID])
     IDX_ROWS[idx], IDX_COLOURS[idx] = rows, colours
+# ---- v3.5 Phase 3 fill audit: Dominant Crop / Final Crop Stage must be real values in every row (run stops otherwise)
+BANNED = ('mixed / mostly unidentified', 'not identified', 'not applicable', 'insufficient data', 'crop unknown')
+_bad = [(rw[5], rw[6], rw[8]) for rw in IDX_ROWS['NDVI'] if not str(rw[6]).strip() or not str(rw[8]).strip()
+        or any(b in f'{rw[6]} {rw[8]}'.lower() for b in BANNED) or (CALENDAR_ESTIMATE and rw[8] == UNC)]
+_bad += [(rw[5], rw[7], rw[23]) for rw in T1_ROWS if not str(rw[23]).strip() or (CALENDAR_ESTIMATE and rw[23] == UNC)]
+if _bad:
+    raise RuntimeError(f'Fill audit failed for {len(_bad)} rows, e.g. {_bad[:5]}')
+_dk = Counter('confirmed' if ('estimate' not in d[2] and d[2] not in ('Fallow – no active crop',)) else
+              'fallow' if d[2] == 'Fallow – no active crop' else 'estimate' for d in DOM.values())
+print(f'✅ Fill audit passed – Dominant Crop and Final Crop Stage filled for all {len(DOM)} tehsils | dominant-crop stage: '
+      + ', '.join(f'{k} {v}' for k, v in _dk.items()))
+print('   Most common dominant crops:', Counter(d[0] for d in DOM.values()).most_common(10))
 _cells = 57 * (len(T1_ROWS) + 1) + 52 * (len(T8_ROWS) + 1) + 6 * len(IDX_HEADER) * (len(TEH) + 1)
 print(f'✅ Index tabs ready ({len(IDX_HEADER)} cols) | workbook ≈ {_cells / 1e6:.2f} M cells (Google Sheets limit 10 M)')
 
