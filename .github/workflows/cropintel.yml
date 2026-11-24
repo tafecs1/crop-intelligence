@@ -47,8 +47,19 @@ jobs:
           echo "count=$N" >> "$GITHUB_OUTPUT"
           echo "shards=$(python3 -c "import json;print(json.dumps(list(range($N))))")" >> "$GITHUB_OUTPUT"
 
+  tests:                             # v4.0 automated tests (synthetic data, no Earth Engine) – extraction starts only if they pass
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - run: pip install -r requirements.txt pytest
+      - run: pytest -q tests
+
   extract:                           # Earth Engine extraction, split by state across parallel jobs
-    needs: setup
+    needs: [setup, tests]
     runs-on: ubuntu-latest
     timeout-minutes: 350
     strategy:
@@ -112,10 +123,19 @@ jobs:
         with:
           path: work/ggcmi
           key: ggcmi-phase3-v1.01
+      - name: Restore CROPGRIDS crop-mix table (downloaded automatically on the first run)
+        uses: actions/cache@v4
+        with:
+          path: work/cropgrids
+          key: cropgrids-v1.07-india
       - run: python crop_intel.py
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: CropIntel-Excel-${{ needs.setup.outputs.run_date }}
-          path: work/Crop_Intelligence_*.xlsx
+          path: |
+            work/Crop_Intelligence_*.xlsx
+            work/stage_report.md
+            work/crop_phenology_db.csv
+            work/validation_report.xlsx
           retention-days: 30
