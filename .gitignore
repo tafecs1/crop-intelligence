@@ -3,3 +3,4 @@ __pycache__/
 *.json
 !data/*.json
 .env
+!tests/*.json
