@@ -135,7 +135,7 @@ on every regenerated workbook before releasing it.
   an OBSERVED planting date. Each observation is assigned to exactly one season row, so overlapping seasons never double count.
   Observations outside every TNAU window are listed in QC_Summary.
 * **Dashboard:** join Tab 8 on **District LGD Code** (it no longer has Tehsil columns).
-* **Tests:** 23 tests pass, including calendar file integrity, district coverage, observation assignment and harvest = sowing + duration.
+* **Tests:** 23 tests pass (25 as of v4.3), including calendar file integrity, district coverage, observation assignment and harvest = sowing + duration.
 
 ## 9. v4.2 – audit of RUN-20261124-130006 (Crop_Intelligence (3).xlsx)
 
@@ -144,3 +144,15 @@ on every regenerated workbook before releasing it.
 | I-19 | All 291 Tamil Nadu tehsils published as "Fallow – no active crop" (0 ha). QC14 on every row: the crop-map (MAPS) and 14-day trend (TREND) Earth Engine reductions returned no data for any tehsil, while monthly / current / weather layers worked. The run still wrote the Sheet. | **Extraction completeness gate** after Cell 7: coverage of monthly, current, maps and trend must be ≥ 95 % of cropland tehsils, otherwise the run stops before writing anything and prints the missing tehsils. A tehsil whose crop maps are missing is labelled "Satellite crop layers missing – not assessed", never fallow. Test 22. **Root cause (extract log of RUN-20261124-123259):** `Expected a homogeneous image collection … band 'm': Float<-1, 1>` – the v4.0 optical water check merged Sentinel-2 MNDWI (`normalizedDifference`, range-typed float) with a plain-float placeholder image; Earth Engine rejected the collection, so every TREND and MAPS batch failed (trend 0 · maps 0). Fixed: no merge for MNDWI (the S2 collection already has a masked placeholder) and Dynamic World uses `If(size > 0)`. |
 | I-20 | Tab 8 rice "Sowing" stage columns used 18-40 d seedling age for every rice season | seedling age by duration class (TNAU: short 18-22, medium 25-30, long 35-40 d); QC note that the rice sowing window is nursery sowing and the stage columns are transplanting |
 | I-21 | Tab 8 "Expected Stage by Calendar" listed stages late → early ("Physiological maturity … Grain filling – dough") | listed early → late |
+
+## 10. v4.3 – audit of RUN-20261124-143636 (Crop_Intelligence (4).xlsx)
+
+Extraction was complete (291/291 on every layer) and all acceptance tests passed, but paddy was badly under-detected.
+
+| ID | Finding | Fix |
+|---|---|---|
+| I-22 | Paddy 52,834 ha state-wide; Thanjavur 7,152 ha vs 76,900 ha reference (9 %). Every looser threshold set raised Thanjavur sharply (9 → 25 → 50 %), which is the signature of mixed pixels rather than of wrong thresholds. Cause: `reduceRegions(scale=100)` made Earth Engine average each Sentinel-1 scene to 100 m **before** the flood test, and the 3×3 speckle filter then spanned 300 m – delta paddy mixed with bunds, roads and coconut rows rarely reached VH < −20 dB. | `RICE_SCALE_M = 20`: every paddy layer (flood test, drop/rise tests, speckle filter, optical water check, harvested and calibration layers) is forced onto a 20 m grid; tehsil fractions are still read at 100 m spacing, i.e. an even systematic sample of the 20 m result (no area bias). `RICE_SIG` includes the scale, so old 100 m caches are not reused. `tileScale` 16. Thresholds unchanged – to be chosen from the 20 m calibration grid. Test 24. |
+| I-23 | State check printed "within reference" for 52,834 ha against a 2.0 M ha all-season target (3 %) – an upper bound cannot detect an undercount | verdict now reads "below upper bound (x % of it) – this check cannot detect an undercount" |
+| Open | "Active cropland – crop unknown" 4.1 M ha = 95 % of WorldCover cropland: "active" = max NDVI ≥ 0.35 since 1 Oct, which weedy fallows also pass in the NE monsoon | next step: require a green-up (rise from a bare-soil low) |
+| Open | Maize 221 rows but 5,274 ha, 94 rows "evidence contradicts" – WorldCereal 2021 maize map weak for Tamil Nadu | treat maize as low confidence; revisit after paddy |
+| Open | Direct-seeded samba (no standing water) is invisible to any flood rule | later step (optical green-up route for delta tehsils) |

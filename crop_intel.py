@@ -63,6 +63,9 @@ GGCMI_WINDOW_DAYS = 30                      # ± days around the GGCMI (multi-ye
 # v3.5: CROPGRIDS 2020 (Tang et al. 2024, Scientific Data, CC BY 4.0) – 173 crops at 0.05° (~5.6 km); per-crop NetCDF files download
 #       automatically (no form, no login). Used to NAME the crops satellites cannot separate (replaces the manual APY/SPAM step).
 USE_CROPGRIDS   = True
+RICE_SCALE_M    = 20                        # v4.3: paddy rule evaluated on 20 m pixels (field scale). At SCALE_M = 100 Earth Engine
+                                            #       averaged each S1 scene to 100 m BEFORE the flood test, mixing paddy with bunds,
+                                            #       roads and trees (Thanjavur 7,152 vs 76,900 ha in RUN-20261124-143636). 0 = old behaviour.
 S1_SPECKLE_PX   = 1                         # v4.0: focal-median radius in pixels (1 = 3×3) applied to every Sentinel-1 scene; 0 = off
 RICE_WATER_CHECK = True                     # v4.0: paddy pixels must also be seen as open water / flooded vegetation by Dynamic World or
                                             #       Sentinel-2 MNDWI at least once in the flooding period (removes rain-wetted black soil)
@@ -79,7 +82,7 @@ REFERENCE_AREAS = [
          date='2026-11-14', source='newkerala.com, 14-Nov-2026 – also reports crops "planted about a month ago"'),
 ]
 FIELD_OBS_CSV    = f'{INPUT_DIR}/field_observations.csv'  # OPTIONAL ground truth: tehsil_lgd,crop,stage,observation_date,planting_date
-MODEL_VERSION   = 'CropIntel-v4.2'
+MODEL_VERSION   = 'CropIntel-v4.3'
 MIN_EXTRACT_COVERAGE = 0.95                 # v4.2: stop before writing if crop maps / trends are missing for > 5 % of cropland tehsils
 RUN_DATE        = os.environ.get('RUN_DATE') or None   # set once per workflow run so all jobs share the same date
 
@@ -610,6 +613,11 @@ def rice_layers(region, vh_th=None, vv_th=None, drop_db=None, rise_db=None, core
     4) established rice = max VH ≥ 14 d after the flood ≥ flood VH + RICE_VH_RISE_DB (canopy growth);
        recent = flooded within RICE_RECENT_DAYS, drop passed, rise not yet seen (puddled / just transplanted → Probable only).
     Permanent water (JRC occurrence > 50 %) and non-cropland (WorldCover) excluded."""
+    # v4.3: every returned layer is forced onto a 20 m grid, so the speckle filter (3×3 = 60 m), flood test, drop/rise tests and
+    #       the optical water check all run on field-size pixels. reduceRegions at SCALE_M then reads these 20 m results at
+    #       100 m spacing – an even systematic sample, so tehsil area fractions are not biased.
+    def _fs(im):
+        return im.reproject(crs='EPSG:4326', scale=RICE_SCALE_M) if RICE_SCALE_M else im
     vh_th = RICE_VH_FLOOD_DB if vh_th is None else vh_th
     vv_th = RICE_VV_FLOOD_DB if vv_th is None else vv_th
     drop_db = RICE_VH_DROP_DB if drop_db is None else drop_db
@@ -649,7 +657,7 @@ def rice_layers(region, vh_th=None, vv_th=None, drop_db=None, rise_db=None, core
         base = base.And(dwp.gte(0.3).Or(mndwi.gte(0.0)).unmask(0))
     est_all = base.And(rise.gte(rise_db)).unmask(0)
     if core_only:                                            # calibration: paddy this season (standing + harvested) + recently flooded
-        return est_all.Or(base.And(ft.gte(fe - RICE_RECENT_DAYS)).unmask(0))
+        return _fs(est_all.Or(base.And(ft.gte(fe - RICE_RECENT_DAYS)).unmask(0)))
     recent = base.And(ft.gte(fe - RICE_RECENT_DAYS)).And(rise.lt(rise_db).unmask(1)).unmask(0).And(est_all.Not())
     # v4.0: flooded 'RICE_RECENT_DAYS'-75 d ago, drop test passed, but no canopy rise yet → reported separately as a CANDIDATE
     #       (possible late-transplanted paddy under deep water, or waterlogging) – never counted as rice
@@ -666,8 +674,9 @@ def rice_layers(region, vh_th=None, vv_th=None, drop_db=None, rise_db=None, core
     v30 = (lo30.select('VH').lt(-18).And(hi30.select('VH').subtract(lo30.select('VH')).gte(3)).And(hi30.select('t').gt(lo30.select('t')))
            .And(CROPLAND).And(WATER.Not())).unmask(0)
     bins = [est.And(ft.gte(a)).And(ft.lt(b)).unmask(0) for a, b in RICE_BINS]
-    return dict(est=est, recent=recent, harv=harv, pend=pend, ft=ft.updateMask(est), ft_recent=ft.updateMask(recent), ft_harv=ft.updateMask(harv),
-                obs=col.select('VH').count().toFloat(), v30=v30, bins=bins)
+    return dict(est=_fs(est), recent=_fs(recent), harv=_fs(harv), pend=_fs(pend), ft=_fs(ft.updateMask(est)),
+                ft_recent=_fs(ft.updateMask(recent)), ft_harv=_fs(ft.updateMask(harv)),
+                obs=_fs(col.select('VH').count().toFloat()), v30=_fs(v30), bins=[_fs(b) for b in bins])
 
 IDX6 = ['NDVI', 'EVI', 'NDWI', 'NDRE', 'SAVI', 'BSI']
 
@@ -984,7 +993,7 @@ def obs_image(region):
 OBS_REDUCER = ee.Reducer.max().combine(ee.Reducer.median(), sharedInputs=True)
 
 def reduce_batch(img, fc_b, scale=None, reducer=None):
-    out = img.reduceRegions(collection=fc_b, reducer=reducer or ee.Reducer.mean(), scale=scale or SCALE_M, tileScale=8)
+    out = img.reduceRegions(collection=fc_b, reducer=reducer or ee.Reducer.mean(), scale=scale or SCALE_M, tileScale=16 if RICE_SCALE_M else 8)
     return [x['properties'] for x in out.map(lambda f: ee.Feature(None, f.toDictionary())).getInfo()['features']]
 
 def safe_reduce(kind, codes, img_fn, add_area=False, scale=None, reducer=None):
@@ -1015,7 +1024,7 @@ def safe_reduce(kind, codes, img_fn, add_area=False, scale=None, reducer=None):
 SAT_MONTHLY, SAT_TREND, SAT_CUR, SAT_MAPS, SAT_WX = {}, {}, {}, {}, {}
 RICE_SIG = hashlib.md5(json.dumps([RICE_VH_FLOOD_DB, RICE_VV_FLOOD_DB, RICE_VH_DROP_DB, RICE_VH_RISE_DB, RICE_FLOOD_LEAD_DAYS,
                                    RICE_RECENT_DAYS, RICE_HARVEST_NDVI, RICE_CALIBRATE, RICE_CAL_SETS, S1_SPECKLE_PX,
-                                   RICE_WATER_CHECK, 'v4.0']).encode()).hexdigest()[:8]
+                                   RICE_WATER_CHECK, RICE_SCALE_M, 'v4.3']).encode()).hexdigest()[:8]
 GEO_AREA_HA = dict(zip(TEH.lgd, (gpd.GeoSeries(TEH.geometry, crs=4326).to_crs(6933).area / 1e4).round(1)))  # full-res, equal-area
 # GitHub: batches are built per state, so a shard job and the final job create identical batches (= identical cache files)
 SHARD_COUNT, SHARD_INDEX = int(os.environ.get('SHARD_COUNT', '1')), int(os.environ.get('SHARD_INDEX', '0'))
@@ -3085,7 +3094,9 @@ for ref in REFERENCE_AREAS:
     est = sum(x[12] or 0 for x in T1_ROWS if x[7].startswith('Rice (paddy)') and x[5] in keep)   # standing + recent + harvested paddy
     old = sum((fnum(SAT_MAPS.get(l, {}).get('rice_frac_v30')) or 0) * GEO_AREA_HA.get(l, 0) for l in teh.lgd)
     ratio = est / ref['ha'] if ref['ha'] else None
-    verdict = ('within reference' if ref['kind'] == 'upper_bound' and est <= ref['ha'] else
+    # v4.3: an all-season upper bound can only catch an OVERcount – say so, with the share, instead of a bare 'within reference'
+    verdict = (f'below upper bound ({ratio:.0%} of it) – this check cannot detect an undercount'
+               if ref['kind'] == 'upper_bound' and est <= ref['ha'] else
                'EXCEEDS upper bound' if ref['kind'] == 'upper_bound' else
                'consistent (±30 %)' if ratio and 0.7 <= ratio <= 1.3 else 'INCONSISTENT (>30 % off)')
     REF_ROWS.append({'Scope': ref['scope'], 'Reference': ref['what'], 'Reference ha': ref['ha'], 'As of': ref['date'],

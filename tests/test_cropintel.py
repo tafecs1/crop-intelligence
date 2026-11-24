@@ -283,3 +283,19 @@ def test_22_extraction_gate_blocks_missing_maps():
     bad = dict(base, SAT_MAPS={}, SAT_TREND={})
     with pytest.raises(SystemExit):
         exec(gate, dict(bad))                                    # maps/trend missing → stops
+
+
+def test_24_rice_layers_run_at_field_scale():
+    """v4.3: every paddy layer must be forced onto the RICE_SCALE_M grid (100 m averaging hid most delta paddy),
+    the cache signature must include the scale, and an upper-bound reference must never read as 'within reference'."""
+    import pathlib, re
+    src = pathlib.Path(__file__).resolve().parents[1].joinpath('crop_intel.py').read_text()
+    assert re.search(r'^RICE_SCALE_M\s*=\s*20\b', src, re.M)
+    body = src[src.index('def rice_layers('):src.index('IDX6 = ')]
+    ret = body[body.index('    return dict('):]
+    for k in ('est', 'recent', 'harv', 'pend', 'ft', 'ft_recent', 'ft_harv', 'obs', 'v30'):
+        assert re.search(rf'\b{k}=_fs\(', ret), k
+    assert 'bins=[_fs(b) for b in bins]' in ret
+    assert 'return _fs(est_all.Or(' in body                      # calibration layers too
+    assert 'RICE_SCALE_M' in src[src.index('RICE_SIG = '):src.index('GEO_AREA_HA = ')]
+    assert "'within reference'" not in src.replace("bare 'within reference'", '')
