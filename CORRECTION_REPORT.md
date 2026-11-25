@@ -135,7 +135,7 @@ on every regenerated workbook before releasing it.
   an OBSERVED planting date. Each observation is assigned to exactly one season row, so overlapping seasons never double count.
   Observations outside every TNAU window are listed in QC_Summary.
 * **Dashboard:** join Tab 8 on **District LGD Code** (it no longer has Tehsil columns).
-* **Tests:** 23 tests pass (25 as of v4.3), including calendar file integrity, district coverage, observation assignment and harvest = sowing + duration.
+* **Tests:** 23 tests pass (27 as of v4.4), including calendar file integrity, district coverage, observation assignment and harvest = sowing + duration.
 
 ## 9. v4.2 – audit of RUN-20261124-130006 (Crop_Intelligence (3).xlsx)
 
@@ -156,3 +156,28 @@ Extraction was complete (291/291 on every layer) and all acceptance tests passed
 | Open | "Active cropland – crop unknown" 4.1 M ha = 95 % of WorldCover cropland: "active" = max NDVI ≥ 0.35 since 1 Oct, which weedy fallows also pass in the NE monsoon | next step: require a green-up (rise from a bare-soil low) |
 | Open | Maize 221 rows but 5,274 ha, 94 rows "evidence contradicts" – WorldCereal 2021 maize map weak for Tamil Nadu | treat maize as low confidence; revisit after paddy |
 | Open | Direct-seeded samba (no standing water) is invisible to any flood rule | later step (optical green-up route for delta tehsils) |
+
+### v4.3 result (RUN-20261124-200405)
+Paddy 52,833 → 286,430 ha state-wide; Thanjavur 7,152 → 39,418 ha (51 % of the 76,900 ha reference). Delta districts rose
+5-7×, dry black-soil districts (Tuticorin 5,418 ha, Virudhunagar 7,862 ha) only 3-4× – no false paddy on dark soil. The remaining
+delta gap is consistent with direct-seeded samba (no standing water) and the 4,110 ha "possible paddy" candidates.
+Extraction took 2 h for 291 tehsils; Earth Engine reported the project over its noncommercial (Community tier) quota
+→ restricted mode, before the first batch.
+
+## 11. v4.4 – final build for the Community tier
+
+| ID | Change |
+|---|---|
+| I-24 | Thresholds kept at −20 / −15 / 3 / 5 dB (no calibration log available; the 20 m run showed they do not invent paddy on dry soils). They can still be changed without code via the repo variables `RICE_VH_FLOOD_DB` etc. |
+| I-25 | Sentinel-1 paddy work masked to WorldCover cropland (same result, less compute). |
+| I-26 | v3.0 comparison layer computed only when `rice_calibrate = true`; the reference check shows "not computed" otherwise. |
+| I-27 | Shards own batches, not whole states – a one-state run now uses every shard (Test 25). |
+| I-28 | `EXTRACT_BUDGET_MIN = 270`: after 4 h 30 min no new Earth Engine work starts; the job ends cleanly, saves its cache, and a same-day re-run resumes. The completeness gate blocks publishing until all batches are done. |
+| I-29 | Weekly scope from repo variable `CROPINTEL_STATES` (empty = all India) and `CROPINTEL_SHARDS`; the manual run boxes override them. |
+| Open | Direct-seeded paddy, "active cropland" green-up test, maize – unchanged. All-India weekly runs are not feasible within the Community quota. |
+
+## 12. v4.5 – automatic resume
+
+| ID | Change |
+|---|---|
+| I-30 | When the 4 h 30 min time budget stops extraction, the shard leaves a flag (tagged with the workflow run) in its cache artifact. The build job then starts no new Earth Engine work, the completeness gate blocks publishing and writes `work/RESUME_NEEDED`. A new `resume` job re-dispatches the workflow with the **same run date**, states and shard count, so every finished batch is reused from the cache. At most 3 automatic resumes per weekly run; Earth Engine errors (not time) are never auto-resumed. Tests 22 and 27. |

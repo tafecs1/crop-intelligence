@@ -82,7 +82,7 @@ REFERENCE_AREAS = [
          date='2026-11-14', source='newkerala.com, 14-Nov-2026 – also reports crops "planted about a month ago"'),
 ]
 FIELD_OBS_CSV    = f'{INPUT_DIR}/field_observations.csv'  # OPTIONAL ground truth: tehsil_lgd,crop,stage,observation_date,planting_date
-MODEL_VERSION   = 'CropIntel-v4.3'
+MODEL_VERSION   = 'CropIntel-v4.5'
 MIN_EXTRACT_COVERAGE = 0.95                 # v4.2: stop before writing if crop maps / trends are missing for > 5 % of cropland tehsils
 RUN_DATE        = os.environ.get('RUN_DATE') or None   # set once per workflow run so all jobs share the same date
 
@@ -626,7 +626,9 @@ def rice_layers(region, vh_th=None, vv_th=None, drop_db=None, rise_db=None, core
     fs, fe = (RICE_FLOOD_START - S1_START).days, (TODAY - S1_START).days
     def prep(i):
         t = ee.Image.constant(i.date().difference(t0, 'day')).toFloat().rename('t')
-        return ee.Image.cat([i.select('VV').toFloat(), i.select('VH').toFloat(), t])
+        # v4.4: compute only on WorldCover cropland – every paddy layer is AND-ed with CROPLAND anyway, so this changes no
+        #       result but skips forests, towns and water in the 20 m work (Earth Engine Community-tier quota, RUN-20261124-200405)
+        return ee.Image.cat([i.select('VV').toFloat(), i.select('VH').toFloat(), t]).updateMask(CROPLAND)
     empty = ee.Image.constant([0, 0, 0]).rename(['VV', 'VH', 't']).toFloat().updateMask(ee.Image.constant(0))
     col = s1_collection(S1_START, TODAY + dt.timedelta(days=1), region, ('VV', 'VH')).map(prep).merge(ee.ImageCollection([empty]))
     def flooded(i):
@@ -669,9 +671,12 @@ def rice_layers(region, vh_th=None, vv_th=None, drop_db=None, rise_db=None, core
     harv = est_all.And(nd30.lt(RICE_HARVEST_NDVI)).And(ft.lte(fe - 80)).unmask(0)
     est = est_all.And(harv.Not())
     # v3.0 rule (lowest VH since SEASON_START−90 d < −18 dB, any later +3 dB) – computed ONLY for the before/after comparison
-    c30 = col.map(lambda i: i.updateMask(i.select('t').gte((V30_START - S1_START).days)).addBands(i.select('VH').multiply(-1).rename('neg')))
-    lo30, hi30 = c30.qualityMosaic('neg'), c30.qualityMosaic('VH')
-    v30 = (lo30.select('VH').lt(-18).And(hi30.select('VH').subtract(lo30.select('VH')).gte(3)).And(hi30.select('t').gt(lo30.select('t')))
+    if not RICE_CALIBRATE:                                    # v4.4: diagnostic only – skipped in weekly runs to save quota
+        v30 = EMPTY_1('v30')
+    else:
+      c30 = col.map(lambda i: i.updateMask(i.select('t').gte((V30_START - S1_START).days)).addBands(i.select('VH').multiply(-1).rename('neg')))
+      lo30, hi30 = c30.qualityMosaic('neg'), c30.qualityMosaic('VH')
+      v30 = (lo30.select('VH').lt(-18).And(hi30.select('VH').subtract(lo30.select('VH')).gte(3)).And(hi30.select('t').gt(lo30.select('t')))
            .And(CROPLAND).And(WATER.Not())).unmask(0)
     bins = [est.And(ft.gte(a)).And(ft.lt(b)).unmask(0) for a, b in RICE_BINS]
     return dict(est=_fs(est), recent=_fs(recent), harv=_fs(harv), pend=_fs(pend), ft=_fs(ft.updateMask(est)),
@@ -996,10 +1001,35 @@ def reduce_batch(img, fc_b, scale=None, reducer=None):
     out = img.reduceRegions(collection=fc_b, reducer=reducer or ee.Reducer.mean(), scale=scale or SCALE_M, tileScale=16 if RICE_SCALE_M else 8)
     return [x['properties'] for x in out.map(lambda f: ee.Feature(None, f.toDictionary())).getInfo()['features']]
 
+# v4.4 time budget (minutes, 0 = none): once spent, no NEW Earth Engine work starts – cached batches still load. The job ends
+#      cleanly before GitHub's 6-hour kill, its cache is saved, and a re-run on the SAME day resumes where it stopped.
+#      The completeness gate then blocks publishing until every batch is done (never a partial Sheet).
+EXTRACT_BUDGET_MIN = float(os.environ.get('EXTRACT_BUDGET_MIN', '0') or 0)
+_T_START = time.time()
+BUDGET_HIT = False
+# v4.5 automatic resume: a shard that runs out of time leaves a flag (tagged with this workflow run) in its cache artifact.
+#      The build job then starts NO new Earth Engine work (it could not save it), the gate stops publishing, a RESUME_NEEDED
+#      marker is written and the workflow re-dispatches itself with the same RUN_DATE so every cached batch is reused.
+RUN_TAG = os.environ.get('GITHUB_RUN_ID', 'local')
+def _budget_flags():
+    try:
+        return [f_ for f_ in os.listdir(CACHE_DIR) if f_.startswith(f'_budget_hit_{RUN_TAG}_') and f_.endswith('.flag')]
+    except FileNotFoundError:
+        return []
+SHARD_FLAGGED = bool(_budget_flags())
+
 def safe_reduce(kind, codes, img_fn, add_area=False, scale=None, reducer=None):
+    global BUDGET_HIT
     p = _cache_path(kind, codes)
     if os.path.exists(p):
         return json.load(open(p))
+    if SHARD_FLAGGED or (EXTRACT_BUDGET_MIN and (time.time() - _T_START) / 60 > EXTRACT_BUDGET_MIN):
+        if not BUDGET_HIT:
+            print('⏱️ ' + ('An extraction shard ran out of time – no new Earth Engine work in this job' if SHARD_FLAGGED else
+                  f'Time budget of {EXTRACT_BUDGET_MIN:.0f} min used – remaining batches skipped') +
+                  '; the workflow resumes automatically from the saved cache (same run date)')
+        BUDGET_HIT = True
+        return []
     def run(cs, depth=0):
         for attempt in range(4):
             try:
@@ -1029,14 +1059,19 @@ GEO_AREA_HA = dict(zip(TEH.lgd, (gpd.GeoSeries(TEH.geometry, crs=4326).to_crs(69
 # GitHub: batches are built per state, so a shard job and the final job create identical batches (= identical cache files)
 SHARD_COUNT, SHARD_INDEX = int(os.environ.get('SHARD_COUNT', '1')), int(os.environ.get('SHARD_INDEX', '0'))
 _by_state = TEH.groupby('state', sort=True).lgd.apply(list)
-_scope = list(_by_state.index)
+_batches = [codes_[i:i + BATCH_SIZE] for st in _by_state.index for codes_ in [_by_state[st]] for i in range(0, len(codes_), BATCH_SIZE)]
 if SHARD_COUNT > 1:
-    _load, _own = [0] * SHARD_COUNT, {}
-    for st in sorted(_scope, key=lambda s_: (-len(_by_state[s_]), s_)):      # greedy, deterministic balancing by tehsil count
-        k_ = _load.index(min(_load)); _own[st] = k_; _load[k_] += len(_by_state[st])
-    _scope = [s_ for s_ in _scope if _own[s_] == SHARD_INDEX]
-    print(f'Shard {SHARD_INDEX + 1}/{SHARD_COUNT}: {len(_scope)} states, {sum(len(_by_state[s_]) for s_ in _scope)} tehsils → {_scope}')
-_batches = [codes_[i:i + BATCH_SIZE] for st in _scope for codes_ in [_by_state[st]] for i in range(0, len(codes_), BATCH_SIZE)]
+    # v4.4: shards own BATCHES, not whole states – a one-state run (Tamil Nadu, 3 batches) used only shard 1 of 3 in
+    #       RUN-20261124-180212. Greedy, deterministic balancing by tehsil count; the build job (SHARD_COUNT = 1) still
+    #       creates the same batch list, so it finds every shard's cache files.
+    _load, _mine = [0] * SHARD_COUNT, []
+    for bi_, b_ in sorted(enumerate(_batches), key=lambda x: (-len(x[1]), x[0])):
+        k_ = _load.index(min(_load)); _load[k_] += len(b_)
+        if k_ == SHARD_INDEX:
+            _mine.append(bi_)
+    _batches = [_batches[i] for i in sorted(_mine)]
+    _st = sorted({s_ for s_ in _by_state.index for b_ in _batches if b_[0] in set(_by_state[s_])})
+    print(f'Shard {SHARD_INDEX + 1}/{SHARD_COUNT}: {len(_batches)} batches, {sum(map(len, _batches))} tehsils → {_st}')
 _mgroups = [MONTHS[i:i + 6] for i in range(0, len(MONTHS), 6)]
 _t0 = time.time()
 for bi, codes in enumerate(_batches, 1):
@@ -1060,6 +1095,8 @@ print(f'✅ Extraction done: monthly {len(SAT_MONTHLY)} · trend {len(SAT_TREND)
 if EXTRACT_ONLY:
     print('Extraction-only shard finished – cache saved in', CACHE_DIR)
     sys.exit(0)
+if BUDGET_HIT and not SHARD_FLAGGED:                  # v4.5: tell the build job (via the cache artifact) that this shard stopped early
+    open(f"{CACHE_DIR}/_budget_hit_{RUN_TAG}_{os.environ.get('SHARD_INDEX', 'x')}.flag", 'w').write(str(TODAY))
 
 # v4.2 extraction completeness gate: a tehsil whose crop-map / trend reduction failed must NEVER be published as "fallow"
 # (RUN-20261124-130006 published all 291 Tamil Nadu tehsils as fallow because every TREND/MAPS batch had failed).
@@ -1078,6 +1115,9 @@ EXTRACT_GAPS = {k: sorted(_base[k] - v) for k, v in _ok.items()}
 print('📡 Extraction coverage: ' + ' · '.join(f'{k} {v:.0%}' for k, v in EXTRACT_COVERAGE.items()))
 _bad = [k for k in ('monthly', 'current', 'maps', 'trend') if EXTRACT_COVERAGE[k] < MIN_EXTRACT_COVERAGE]
 if _bad:
+    if BUDGET_HIT:                                    # v4.5: incomplete because time ran out → ask the workflow to resume itself
+        open(os.environ.get('RESUME_MARKER', f'{WORK_DIR}/RESUME_NEEDED'), 'w').write(str(TODAY))
+        print('🔁 Extraction incomplete because the time budget was used – RESUME_NEEDED written; nothing is published this time')
     raise SystemExit(f'⛔ Earth Engine extraction incomplete for {_bad} (coverage below {MIN_EXTRACT_COVERAGE:.0%}; missing e.g. '
                      f'{ {k: EXTRACT_GAPS[k][:5] for k in _bad} }). Nothing is written – see the "retry" / "gave up" lines above for '
                      'the Earth Engine error, fix it and re-run (completed batches are cached).')
@@ -3092,7 +3132,8 @@ for ref in REFERENCE_AREAS:
         continue
     keep = set(teh.lgd)
     est = sum(x[12] or 0 for x in T1_ROWS if x[7].startswith('Rice (paddy)') and x[5] in keep)   # standing + recent + harvested paddy
-    old = sum((fnum(SAT_MAPS.get(l, {}).get('rice_frac_v30')) or 0) * GEO_AREA_HA.get(l, 0) for l in teh.lgd)
+    old = (sum((fnum(SAT_MAPS.get(l, {}).get('rice_frac_v30')) or 0) * GEO_AREA_HA.get(l, 0) for l in teh.lgd)
+           if RICE_CALIBRATE else None)                       # v4.4: the v3.0 layer is computed only in calibration runs
     ratio = est / ref['ha'] if ref['ha'] else None
     # v4.3: an all-season upper bound can only catch an OVERcount – say so, with the share, instead of a bare 'within reference'
     verdict = (f'below upper bound ({ratio:.0%} of it) – this check cannot detect an undercount'
@@ -3100,7 +3141,7 @@ for ref in REFERENCE_AREAS:
                'EXCEEDS upper bound' if ref['kind'] == 'upper_bound' else
                'consistent (±30 %)' if ratio and 0.7 <= ratio <= 1.3 else 'INCONSISTENT (>30 % off)')
     REF_ROWS.append({'Scope': ref['scope'], 'Reference': ref['what'], 'Reference ha': ref['ha'], 'As of': ref['date'],
-                     'Source': ref['source'], 'v3.0 rule ha (same run)': round(old), 'Current-rule estimate ha': round(est),
+                     'Source': ref['source'], 'v3.0 rule ha (same run)': round(old) if old is not None else 'not computed', 'Current-rule estimate ha': round(est),
                      'Estimate / reference': round(ratio, 2) if ratio else '', 'Verdict': verdict,
                      'Note': 'Partial coverage if the run is filtered to some states/districts' if STATE_FILTER else '',
                      **({f'Calibration {cs} ha': round(sum((fnum(SAT_MAPS.get(l, {}).get(f'rice_cal_{k}')) or 0) * GEO_AREA_HA.get(l, 0)
@@ -3112,7 +3153,8 @@ GATE = Counter(q.split(':')[0] for x in T1_ROWS for q in str(x[51]).split('; ') 
 VAL_SUMMARY = pd.DataFrame([{'Crop': k[0], 'Stage result': k[1], 'Rows': v} for k, v in sorted(STAGE_KIND.items())])
 print('📏 Reference checks:')
 for rr in REF_ROWS:
-    print(f"   {rr['Scope']}: old v3.0 rule {rr['v3.0 rule ha (same run)']:,} ha → current rule {rr['Current-rule estimate ha']:,} ha vs {rr['Reference']} "
+    _o = rr['v3.0 rule ha (same run)']
+    print(f"   {rr['Scope']}: old v3.0 rule {f'{_o:,} ha' if isinstance(_o, (int, float)) else _o} → current rule {rr['Current-rule estimate ha']:,} ha vs {rr['Reference']} "
           f"{rr['Reference ha']:,} ha → {rr['Verdict']}")
 if RICE_CALIBRATE:
     print('🎚️ Rice threshold calibration (VH flood, VV flood, drop, rise) → paddy ha this season (standing + harvested + recently flooded):')

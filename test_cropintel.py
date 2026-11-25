@@ -276,13 +276,19 @@ def test_22_extraction_gate_blocks_missing_maps():
     a = src.index('# v4.2 extraction completeness gate')
     b = src.index("'the Earth Engine error, fix it and re-run (completed batches are cached).')") + len("'the Earth Engine error, fix it and re-run (completed batches are cached).')")
     gate = src[a:b]
-    base = dict(_batches=[['1', '2', '3']], TREND_STEPS=12, MIN_EXTRACT_COVERAGE=0.95,
+    import os as _os, tempfile
+    tmp = tempfile.mkdtemp()
+    base = dict(os=_os, WORK_DIR=tmp, TODAY='2026-11-30', BUDGET_HIT=False, _batches=[['1', '2', '3']], TREND_STEPS=12, MIN_EXTRACT_COVERAGE=0.95,
                 SAT_MONTHLY={'1': {}, '2': {}, '3': {}}, SAT_CUR={k: {'crop_share': 0.5} for k in '123'}, SAT_WX={})
     ok = dict(base, SAT_MAPS={k: {'active_frac': 0.4} for k in '123'}, SAT_TREND={k: {'NDVI_T00': 0.3} for k in '123'})
     exec(gate, dict(ok))                                         # complete → passes
     bad = dict(base, SAT_MAPS={}, SAT_TREND={})
     with pytest.raises(SystemExit):
         exec(gate, dict(bad))                                    # maps/trend missing → stops
+    assert not _os.path.exists(_os.path.join(tmp, 'RESUME_NEEDED'))   # an Earth Engine error is NOT auto-resumed
+    with pytest.raises(SystemExit):
+        exec(gate, dict(bad, BUDGET_HIT=True))                   # v4.5: time budget used → stops AND asks to resume
+    assert _os.path.exists(_os.path.join(tmp, 'RESUME_NEEDED'))
 
 
 def test_24_rice_layers_run_at_field_scale():
@@ -299,3 +305,46 @@ def test_24_rice_layers_run_at_field_scale():
     assert 'return _fs(est_all.Or(' in body                      # calibration layers too
     assert 'RICE_SCALE_M' in src[src.index('RICE_SIG = '):src.index('GEO_AREA_HA = ')]
     assert "'within reference'" not in src.replace("bare 'within reference'", '')
+
+
+def test_25_shards_split_batches_within_one_state():
+    """v4.4: a one-state run must spread its batches over the shards, and the shards together must equal the full batch list."""
+    import pathlib, pandas as pd, os as _os
+    src = pathlib.Path(__file__).resolve().parents[1].joinpath('crop_intel.py').read_text()
+    a = src.index('# GitHub: batches are built per state')
+    b = src.index("print(f'Shard {SHARD_INDEX + 1}/{SHARD_COUNT}: {len(_batches)} batches")
+    code = src[a:src.index('\n', b) + 1]
+    teh = pd.DataFrame({'state': ['TAMIL NADU'] * 291, 'lgd': [str(i) for i in range(291)]})
+    def run(count, idx):
+        _os.environ['SHARD_COUNT'], _os.environ['SHARD_INDEX'] = str(count), str(idx)
+        ns = dict(os=_os, TEH=teh, BATCH_SIZE=100); exec(code, ns); return ns['_batches']
+    full = run(1, 0)
+    parts = [run(3, k) for k in range(3)]
+    assert all(len(p) == 1 for p in parts)                          # 3 batches → one per shard
+    assert sorted(map(tuple, sum(parts, []))) == sorted(map(tuple, full))
+    _os.environ['SHARD_COUNT'], _os.environ['SHARD_INDEX'] = '1', '0'
+
+
+def test_26_quota_savers():
+    """v4.4: S1 paddy work is masked to cropland; the v3.0 diagnostic runs only in calibration runs; extraction has a time budget."""
+    import pathlib
+    src = pathlib.Path(__file__).resolve().parents[1].joinpath('crop_intel.py').read_text()
+    body = src[src.index('def rice_layers('):src.index('IDX6 = ')]
+    assert ".updateMask(CROPLAND)" in body and 'if not RICE_CALIBRATE:' in body
+    assert "EXTRACT_BUDGET_MIN = float(os.environ.get('EXTRACT_BUDGET_MIN'" in src and 'BUDGET_HIT = True' in src
+
+
+def test_27_resume_workflow_wiring():
+    """v4.5: the workflow re-dispatches itself (same run date, capped) only when the build job reports RESUME_NEEDED."""
+    import pathlib, yaml
+    wf = yaml.safe_load(pathlib.Path(__file__).resolve().parents[1].joinpath('.github/workflows/cropintel.yml').read_text())
+    inputs = wf[True]['workflow_dispatch']['inputs']
+    assert {'run_date', 'resume_attempt'} <= set(inputs)
+    assert wf['jobs']['build']['outputs']['resume'] == '${{ steps.chk.outputs.resume }}'
+    r = wf['jobs']['resume']
+    assert "needs.build.outputs.resume == 'true'" in r['if'] and '< 3' in r['if']
+    assert r['permissions'] == {'actions': 'write'}
+    cmd = r['steps'][0]['run']
+    assert 'gh workflow run cropintel.yml' in cmd and 'run_date="${{ needs.setup.outputs.run_date }}"' in cmd
+    setup = wf['jobs']['setup']['steps'][0]['run']
+    assert 'github.event.inputs.run_date' in setup
