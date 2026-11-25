@@ -278,7 +278,7 @@ def test_22_extraction_gate_blocks_missing_maps():
     gate = src[a:b]
     import os as _os, tempfile
     tmp = tempfile.mkdtemp()
-    base = dict(os=_os, WORK_DIR=tmp, TODAY='2026-11-30', BUDGET_HIT=False, _batches=[['1', '2', '3']], TREND_STEPS=12, MIN_EXTRACT_COVERAGE=0.95,
+    base = dict(os=_os, WORK_DIR=tmp, TODAY='2026-11-30', BUDGET_HIT=False, MISSING_SHARDS=0, _batches=[['1', '2', '3']], TREND_STEPS=12, MIN_EXTRACT_COVERAGE=0.95,
                 SAT_MONTHLY={'1': {}, '2': {}, '3': {}}, SAT_CUR={k: {'crop_share': 0.5} for k in '123'}, SAT_WX={})
     ok = dict(base, SAT_MAPS={k: {'active_frac': 0.4} for k in '123'}, SAT_TREND={k: {'NDVI_T00': 0.3} for k in '123'})
     exec(gate, dict(ok))                                         # complete → passes
@@ -288,6 +288,10 @@ def test_22_extraction_gate_blocks_missing_maps():
     assert not _os.path.exists(_os.path.join(tmp, 'RESUME_NEEDED'))   # an Earth Engine error is NOT auto-resumed
     with pytest.raises(SystemExit):
         exec(gate, dict(bad, BUDGET_HIT=True))                   # v4.5: time budget used → stops AND asks to resume
+    assert _os.path.exists(_os.path.join(tmp, 'RESUME_NEEDED'))
+    _os.remove(_os.path.join(tmp, 'RESUME_NEEDED'))
+    with pytest.raises(SystemExit):
+        exec(gate, dict(bad, MISSING_SHARDS=2))                  # v4.7: a crashed shard → stop AND resume
     assert _os.path.exists(_os.path.join(tmp, 'RESUME_NEEDED'))
 
 
@@ -398,3 +402,36 @@ def test_29_shard_handoff_before_exit_and_schedule_guards():
     assert up['with']['path'] == 'work/shard_out'
     assert any(s.get('uses', '').startswith('actions/cache/save') for s in j['build']['steps'])
     assert j['keepalive']['if'] == "${{ github.event.schedule == '30 20 * * 0' }}"
+
+
+def test_30_earth_engine_429_waits_and_crashed_shards_resume():
+    """v4.7: Earth Engine 'Too Many Requests / concurrency limit' is retried with back-off (other errors still raise), and a
+    shard without a done-flag makes the build job resume instead of extracting itself."""
+    import pathlib, types, time as _t, os as _os, tempfile
+    src = pathlib.Path(__file__).resolve().parents[1].joinpath('crop_intel.py').read_text()
+    blk = src[src.index('import random as _rnd'):src.index('ee.data.computeValue = _compute_value_patient')]
+    calls = {'n': 0}
+    def flaky(*a, **k):
+        calls['n'] += 1
+        if calls['n'] < 3:
+            raise RuntimeError('Too Many Requests: Exceeded Earth Engine concurrency limit. Your project is in Restricted Mode.')
+        return 'ok'
+    ee = types.SimpleNamespace(data=types.SimpleNamespace(computeValue=flaky))
+    ns = dict(os=_os, time=types.SimpleNamespace(time=_t.time, sleep=lambda s: None), ee=ee)
+    exec(blk, ns)
+    assert ns['_compute_value_patient']() == 'ok' and calls['n'] == 3
+    def broken(*a, **k):
+        raise RuntimeError('Image.reduceRegions: bad band')
+    ns['_ee_compute_value'] = broken
+    with pytest.raises(RuntimeError):
+        ns['_compute_value_patient']()
+    d = tempfile.mkdtemp()
+    for k in (0, 2):
+        open(_os.path.join(d, f'_shard_done_77_{k}.flag'), 'w').write('x')
+    a = src.index('def _done_flags():'); b = src.index('SHARD_FLAGGED = bool(_budget_flags())')
+    env = dict(_os.environ); _os.environ['SHARD_TOTAL'] = '3'
+    try:
+        ns2 = dict(os=_os, CACHE_DIR=d, RUN_TAG='77'); exec(src[a:b], ns2)
+    finally:
+        _os.environ.clear(); _os.environ.update(env)
+    assert ns2['MISSING_SHARDS'] == 1

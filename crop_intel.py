@@ -82,7 +82,7 @@ REFERENCE_AREAS = [
          date='2026-11-14', source='newkerala.com, 14-Nov-2026 – also reports crops "planted about a month ago"'),
 ]
 FIELD_OBS_CSV    = f'{INPUT_DIR}/field_observations.csv'  # OPTIONAL ground truth: tehsil_lgd,crop,stage,observation_date,planting_date
-MODEL_VERSION   = 'CropIntel-v4.6'
+MODEL_VERSION   = 'CropIntel-v4.7'
 MIN_EXTRACT_COVERAGE = 0.95                 # v4.2: stop before writing if crop maps / trends are missing for > 5 % of cropland tehsils
 RUN_DATE        = os.environ.get('RUN_DATE') or None   # set once per workflow run so all jobs share the same date
 
@@ -97,6 +97,26 @@ key_info = json.loads(os.environ['EE_KEY_JSON'])
 ee.Initialize(ee.ServiceAccountCredentials(key_info['client_email'], key_data=json.dumps(key_info)),
               project=EE_PROJECT or key_info.get('project_id'))
 print('✅ Earth Engine connected as', key_info['client_email'])
+# v4.7: Earth Engine "429 Too Many Requests / concurrency limit" (restricted mode, many parallel shards) is a WAIT signal, not an
+#       error. Every Earth Engine value request (getInfo → ee.data.computeValue) now waits and retries with jittered back-off for up
+#       to EE_429_MAX_MIN minutes instead of crashing the shard (shards 17 and 19 of RUN 2026-11-25 died in their first minute).
+import random as _rnd
+EE_429_MAX_MIN = float(os.environ.get('EE_429_MAX_MIN', '45') or 45)
+_ee_compute_value = ee.data.computeValue
+def _compute_value_patient(*a, **k):
+    t0_, wait_ = time.time(), 20.0
+    while True:
+        try:
+            return _ee_compute_value(*a, **k)
+        except Exception as e_:
+            m_ = str(e_).lower()
+            if not any(s_ in m_ for s_ in ('too many requests', 'concurrency limit', '429', 'rate limit')) \
+                    or (time.time() - t0_) / 60 > EE_429_MAX_MIN:
+                raise
+            s_ = wait_ * (0.75 + 0.5 * _rnd.random())
+            print(f'   ⏳ Earth Engine busy (concurrency limit) – waiting {s_:.0f} s', flush=True)
+            time.sleep(s_); wait_ = min(wait_ * 2, 300)
+ee.data.computeValue = _compute_value_patient
 
 def can_edit(client, sid):
     """Real write test: re-saves the Sheet's own title (no visible change)."""
@@ -1016,7 +1036,18 @@ def _budget_flags():
         return [f_ for f_ in os.listdir(CACHE_DIR) if f_.startswith(f'_budget_hit_{RUN_TAG}_') and f_.endswith('.flag')]
     except FileNotFoundError:
         return []
-SHARD_FLAGGED = bool(_budget_flags())
+# v4.7: every shard that finishes its hand-off leaves _shard_done_<run>_<k>.flag. The build job (SHARD_TOTAL = number of shards)
+#       treats a MISSING done-flag like a time-budget stop: a crashed shard (e.g. Earth Engine 429 at start-up) → automatic resume.
+def _done_flags():
+    try:
+        return [f_ for f_ in os.listdir(CACHE_DIR) if f_.startswith(f'_shard_done_{RUN_TAG}_') and f_.endswith('.flag')]
+    except FileNotFoundError:
+        return []
+SHARD_TOTAL = int(os.environ.get('SHARD_TOTAL', '0') or 0)
+MISSING_SHARDS = max(0, SHARD_TOTAL - len(_done_flags())) if SHARD_TOTAL > 1 else 0
+if MISSING_SHARDS:
+    print(f'⚠️ {MISSING_SHARDS} of {SHARD_TOTAL} extraction shards did not finish (crashed or killed) – their batches are resumed automatically')
+SHARD_FLAGGED = bool(_budget_flags()) or bool(MISSING_SHARDS)
 CACHE_USED = set()                                    # v4.6: cache files this run used – the only files a shard hands to the build job
 
 # v4.6 name-based cache pruning (replaces the 20-day file-age rule, which would wipe last month's work before a monthly run):
@@ -1030,7 +1061,8 @@ def prune_cache():
         m_ = re.match(r'M_(\d{6})_(\d{6})(?:_\d{4}-\d{2}-\d{2})?_[0-9a-f]{12}\.json$', f_)
         old = ((d_ and d_.group(1) != str(TODAY)) or
                (m_ and m_.group(2) < f'{MONTHS[0]:%Y%m}') or
-               (f_.startswith('_budget_hit_') and not f_.startswith(f'_budget_hit_{RUN_TAG}_')))
+               (f_.startswith('_budget_hit_') and not f_.startswith(f'_budget_hit_{RUN_TAG}_')) or
+               (f_.startswith('_shard_done_') and not f_.startswith(f'_shard_done_{RUN_TAG}_')))
         if old:
             os.remove(os.path.join(CACHE_DIR, f_)); n_ += 1
     if n_:
@@ -1118,6 +1150,9 @@ print(f'✅ Extraction done: monthly {len(SAT_MONTHLY)} · trend {len(SAT_TREND)
 if BUDGET_HIT and not SHARD_FLAGGED:                  # v4.5: tell the build job (via the cache artifact) that this shard stopped early
     _fl = f"{CACHE_DIR}/_budget_hit_{RUN_TAG}_{os.environ.get('SHARD_INDEX', 'x')}.flag"
     open(_fl, 'w').write(str(TODAY)); CACHE_USED.add(_fl)
+if os.environ.get('SHARD_INDEX') is not None:         # v4.7: this shard reached its hand-off (did not crash)
+    _df = f"{CACHE_DIR}/_shard_done_{RUN_TAG}_{os.environ['SHARD_INDEX']}.flag"
+    open(_df, 'w').write(str(TODAY)); CACHE_USED.add(_df)
 # ---- end of extraction hand-off ----
 if EXTRACT_ONLY:                                      # v4.6: hand only the files this shard used to the build job
     import shutil
@@ -1145,9 +1180,9 @@ EXTRACT_GAPS = {k: sorted(_base[k] - v) for k, v in _ok.items()}
 print('📡 Extraction coverage: ' + ' · '.join(f'{k} {v:.0%}' for k, v in EXTRACT_COVERAGE.items()))
 _bad = [k for k in ('monthly', 'current', 'maps', 'trend') if EXTRACT_COVERAGE[k] < MIN_EXTRACT_COVERAGE]
 if _bad:
-    if BUDGET_HIT:                                    # v4.5: incomplete because time ran out → ask the workflow to resume itself
+    if BUDGET_HIT or MISSING_SHARDS:                                    # v4.5: incomplete because time ran out → ask the workflow to resume itself
         open(os.environ.get('RESUME_MARKER', f'{WORK_DIR}/RESUME_NEEDED'), 'w').write(str(TODAY))
-        print('🔁 Extraction incomplete because the time budget was used – RESUME_NEEDED written; nothing is published this time')
+        print('🔁 Extraction incomplete (time budget used or a shard did not finish) – RESUME_NEEDED written; nothing is published this time')
     raise SystemExit(f'⛔ Earth Engine extraction incomplete for {_bad} (coverage below {MIN_EXTRACT_COVERAGE:.0%}; missing e.g. '
                      f'{ {k: EXTRACT_GAPS[k][:5] for k in _bad} }). Nothing is written – see the "retry" / "gave up" lines above for '
                      'the Earth Engine error, fix it and re-run (completed batches are cached).')

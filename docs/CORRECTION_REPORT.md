@@ -135,7 +135,7 @@ on every regenerated workbook before releasing it.
   an OBSERVED planting date. Each observation is assigned to exactly one season row, so overlapping seasons never double count.
   Observations outside every TNAU window are listed in QC_Summary.
 * **Dashboard:** join Tab 8 on **District LGD Code** (it no longer has Tehsil columns).
-* **Tests:** 30 tests pass (v4.6), including calendar file integrity, district coverage, observation assignment and harvest = sowing + duration.
+* **Tests:** 31 tests pass (v4.7), including calendar file integrity, district coverage, observation assignment and harvest = sowing + duration.
 
 ## 9. v4.2 – audit of RUN-20261124-130006 (Crop_Intelligence (3).xlsx)
 
@@ -194,3 +194,16 @@ Test of v4.5 (RUN-20261125-030702, Tamil Nadu, 3 shards): one batch per shard, 5
 | I-33 | Monthly composites grouped by calendar half-year (Jan-Jun, Jul-Dec). The rolling 6-month groups changed every month, so a monthly run could never reuse last month's composites. |
 | I-34 | One shared cache (`ee-cache-all-*`): every job restores it; the build job merges the shards' output and saves it (also after a stopped run, so resumes reuse it). Shards hand over only the files they used (`work/shard_out`). Pruning by the date in the file name (other run dates, months outside the 24-month window, other runs' flags) replaces the 20-day file-age rule. A Monday `keepalive` job restores the cache so GitHub's 7-day eviction never removes it between monthly runs (Test 28). |
 | I-35 | `build`/`tests` never run for a schedule that is switched off (the build job's `!cancelled()` alone would have started an all-India build with no extraction). |
+
+## 14. v4.7 – Earth Engine concurrency limit
+
+First all-India run (2026-11-25, 20 shards, restricted mode): the budget stop and automatic resume worked (coverage after round 1:
+monthly 82 %, trend 38 %, maps 30 %, current 24 %; nothing published). Shards 17 and 19 crashed within a minute with
+`429 Too Many Requests: Exceeded Earth Engine concurrency limit` on their first request – 20 parallel shards exceed the
+restricted-mode concurrency limit.
+
+| ID | Change |
+|---|---|
+| I-36 | Every Earth Engine value request waits and retries on 429 / concurrency-limit errors (jittered back-off 20 s → 5 min, up to `EE_429_MAX_MIN` = 45 min); other errors still raise (Test 30). |
+| I-37 | Each shard leaves a done-flag at its hand-off; the build job (`SHARD_TOTAL`) treats a missing one like a time-budget stop → automatic resume, and starts no Earth Engine work itself (Tests 22, 30). |
+| I-38 | Default monthly shards 20 → 10 (`CROPINTEL_MONTHLY_SHARDS`), fewer simultaneous requests against the concurrency limit. |
