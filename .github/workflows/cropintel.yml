@@ -1,12 +1,17 @@
-name: CropIntel weekly
+name: CropIntel
 
 on:
   schedule:
-    - cron: '30 20 * * 0'          # every Monday 02:00 IST (Sunday 20:30 UTC)
+    # v4.6 schedule – repo variable CROPINTEL_SCHEDULE (Settings → Secrets and variables → Actions → Variables):
+    #   monthly (default / not set) = ALL INDIA on the 2nd of every month
+    #   weekly                      = every Monday, states from CROPINTEL_STATES (not set = all India); no monthly run
+    #   both                        = monthly all-India + weekly CROPINTEL_STATES
+    - cron: '30 20 1 * *'          # 2nd of every month 02:00 IST (1st 20:30 UTC) – just after the Earth Engine quota reset
+    - cron: '30 20 * * 0'          # every Monday 02:00 IST (Sunday 20:30 UTC); also keeps the shared cache alive
   workflow_dispatch:
     inputs:
       state_filter:
-        description: 'States, comma-separated (empty = ALL INDIA), e.g. Tamil Nadu,Kerala'
+        description: 'States, comma-separated, e.g. Tamil Nadu,Kerala – ALL = all India (empty = repo variable CROPINTEL_STATES, else all India)'
         required: false
         default: ''
       shards:
@@ -31,9 +36,9 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  # v4.4: scheduled runs use the repo variable CROPINTEL_STATES (Settings → Secrets and variables → Actions → Variables),
-  #       e.g. "Tamil Nadu"; empty = ALL INDIA. A manual run's States box overrides it.
-  STATE_FILTER: ${{ github.event.inputs.state_filter || vars.CROPINTEL_STATES || '' }}
+  # v4.6: monthly schedule = ALL INDIA; weekly schedule = CROPINTEL_STATES (not set = all India);
+  #       manual run = the States box (ALL = all India), else CROPINTEL_STATES, else all India.
+  STATE_FILTER: ${{ github.event.schedule == '30 20 1 * *' && 'ALL' || (github.event.inputs.state_filter || vars.CROPINTEL_STATES || 'ALL') }}
   EXTRACT_BUDGET_MIN: '270'        # v4.4: start no new Earth Engine work after 4 h 30 min (job timeout 350 min; one restricted-mode batch can take ~1 h)
   RICE_CALIBRATE: ${{ github.event.inputs.rice_calibrate || 'false' }}
   # chosen rice thresholds: Settings → Secrets and variables → Actions → Variables (empty = defaults in crop_intel.py)
@@ -45,6 +50,8 @@ env:
 
 jobs:
   setup:
+    # v4.6: which scheduled runs go is set by CROPINTEL_SCHEDULE (monthly | weekly | both); manual runs always go
+    if: ${{ github.event_name != 'schedule' || (github.event.schedule == '30 20 1 * *' && vars.CROPINTEL_SCHEDULE != 'weekly') || (github.event.schedule == '30 20 * * 0' && (vars.CROPINTEL_SCHEDULE == 'weekly' || vars.CROPINTEL_SCHEDULE == 'both')) }}
     runs-on: ubuntu-latest
     outputs:
       run_date: ${{ steps.p.outputs.run_date }}
@@ -53,13 +60,14 @@ jobs:
     steps:
       - id: p
         run: |
-          N="${{ github.event.inputs.shards || vars.CROPINTEL_SHARDS || '6' }}"
+          N="${{ github.event.schedule == '30 20 1 * *' && (vars.CROPINTEL_MONTHLY_SHARDS || '20') || (github.event.inputs.shards || vars.CROPINTEL_SHARDS || '6') }}"
           D="${{ github.event.inputs.run_date }}"
           echo "run_date=${D:-$(TZ=Asia/Kolkata date +%F)}" >> "$GITHUB_OUTPUT"
           echo "count=$N" >> "$GITHUB_OUTPUT"
           echo "shards=$(python3 -c "import json;print(json.dumps(list(range($N))))")" >> "$GITHUB_OUTPUT"
 
   tests:                             # v4.0 automated tests (synthetic data, no Earth Engine) – extraction starts only if they pass
+    if: ${{ github.event_name != 'schedule' || (github.event.schedule == '30 20 1 * *' && vars.CROPINTEL_SCHEDULE != 'weekly') || (github.event.schedule == '30 20 * * 0' && (vars.CROPINTEL_SCHEDULE == 'weekly' || vars.CROPINTEL_SCHEDULE == 'both')) }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -92,24 +100,22 @@ jobs:
           python-version: '3.12'
           cache: pip
       - run: pip install -r requirements.txt
-      - name: Restore Earth Engine cache (previous weeks – reuses unchanged past months)
-        uses: actions/cache@v4
+      - name: Restore the shared Earth Engine cache (finished half-years + same-day work of an interrupted run)
+        uses: actions/cache/restore@v4
         with:
           path: work/cache
-          key: ee-cache-${{ matrix.shard }}-${{ github.run_id }}
-          restore-keys: ee-cache-${{ matrix.shard }}-
-      - name: Drop cache files older than 20 days (keeps the cache small)
-        run: find work/cache -name '*.json' -mtime +20 -delete 2>/dev/null || true
+          key: ee-cache-all-${{ github.run_id }}
+          restore-keys: ee-cache-all-
       - run: python crop_intel.py
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4          # v4.6: only the cache files this shard used (crop_intel.py → work/shard_out)
         with:
           name: cache-shard-${{ matrix.shard }}
-          path: work/cache
+          path: work/shard_out
           retention-days: 3
 
   build:                             # full pipeline from the cache → 8 tabs in the Google Sheet + Excel artifact
     needs: [setup, extract]
-    if: ${{ !cancelled() }}
+    if: ${{ !cancelled() && needs.setup.result == 'success' }}    # v4.6: never run when the weekly schedule was skipped
     runs-on: ubuntu-latest
     timeout-minutes: 350
     outputs:
@@ -127,6 +133,12 @@ jobs:
           python-version: '3.12'
           cache: pip
       - run: pip install -r requirements.txt
+      - name: Restore the shared Earth Engine cache (so saving it below keeps all states' finished half-years)
+        uses: actions/cache/restore@v4
+        with:
+          path: work/cache
+          key: ee-cache-all-${{ github.run_id }}
+          restore-keys: ee-cache-all-
       - uses: actions/download-artifact@v4
         with:
           pattern: cache-shard-*
@@ -143,6 +155,12 @@ jobs:
           path: work/cropgrids
           key: cropgrids-v1.07-india
       - run: python crop_intel.py
+      - name: Save the shared Earth Engine cache (pruned by crop_intel.py; also after a stopped run, for the resume)
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: work/cache
+          key: ee-cache-all-${{ github.run_id }}
       - id: chk                    # v4.5: crop_intel.py writes work/RESUME_NEEDED when extraction stopped on the time budget
         if: always()
         run: |
@@ -174,3 +192,14 @@ jobs:
             -f state_filter="${{ env.STATE_FILTER }}" -f shards="${{ needs.setup.outputs.count }}" \
             -f rice_calibrate="${{ env.RICE_CALIBRATE }}" -f run_date="${{ needs.setup.outputs.run_date }}" \
             -f resume_attempt="$N"
+
+  keepalive:                         # v4.6: GitHub deletes caches unused for 7 days – touch the shared cache every Monday
+    if: ${{ github.event.schedule == '30 20 * * 0' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/cache/restore@v4
+        with:
+          path: work/cache
+          key: ee-cache-all-keepalive
+          restore-keys: ee-cache-all-
+      - run: echo "Shared cache files kept alive:" && (ls work/cache 2>/dev/null | wc -l)
