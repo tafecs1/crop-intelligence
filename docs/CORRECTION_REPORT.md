@@ -135,7 +135,7 @@ on every regenerated workbook before releasing it.
   an OBSERVED planting date. Each observation is assigned to exactly one season row, so overlapping seasons never double count.
   Observations outside every TNAU window are listed in QC_Summary.
 * **Dashboard:** join Tab 8 on **District LGD Code** (it no longer has Tehsil columns).
-* **Tests:** 23 tests pass (27 as of v4.4), including calendar file integrity, district coverage, observation assignment and harvest = sowing + duration.
+* **Tests:** 30 tests pass (v4.6), including calendar file integrity, district coverage, observation assignment and harvest = sowing + duration.
 
 ## 9. v4.2 – audit of RUN-20261124-130006 (Crop_Intelligence (3).xlsx)
 
@@ -181,3 +181,16 @@ Extraction took 2 h for 291 tehsils; Earth Engine reported the project over its 
 | ID | Change |
 |---|---|
 | I-30 | When the 4 h 30 min time budget stops extraction, the shard leaves a flag (tagged with the workflow run) in its cache artifact. The build job then starts no new Earth Engine work, the completeness gate blocks publishing and writes `work/RESUME_NEEDED`. A new `resume` job re-dispatches the workflow with the **same run date**, states and shard count, so every finished batch is reused from the cache. At most 3 automatic resumes per weekly run; Earth Engine errors (not time) are never auto-resumed. Tests 22 and 27. |
+
+## 13. v4.6 – monthly all-India schedule
+
+Test of v4.5 (RUN-20261125-030702, Tamil Nadu, 3 shards): one batch per shard, 57 min wall time instead of 2 h, coverage 100 %,
+18/18 data checks, Sheet written, no resume needed. Paddy 281,309 ha (Thanjavur 38,514 ha); 1-4 % below v4.3 in every district.
+
+| ID | Change |
+|---|---|
+| I-31 | **Bug (v4.5):** in the GitHub build the time-budget flag was written *after* the extract-only `sys.exit`, so a stopped shard never told the build job; the build job would then have spent quota on work it could not save. The hand-off now happens before the exit (Test 29). |
+| I-32 | Schedule set by repo variable `CROPINTEL_SCHEDULE`: `monthly` (default, not set) = **all India on the 2nd of every month, 02:00 IST** – just after the Earth Engine quota reset; `weekly` = every Monday, states from `CROPINTEL_STATES` (not set = all India); `both`. Manual runs: States box, `ALL` = all India. Monthly runs use `CROPINTEL_MONTHLY_SHARDS` (default 20). |
+| I-33 | Monthly composites grouped by calendar half-year (Jan-Jun, Jul-Dec). The rolling 6-month groups changed every month, so a monthly run could never reuse last month's composites. |
+| I-34 | One shared cache (`ee-cache-all-*`): every job restores it; the build job merges the shards' output and saves it (also after a stopped run, so resumes reuse it). Shards hand over only the files they used (`work/shard_out`). Pruning by the date in the file name (other run dates, months outside the 24-month window, other runs' flags) replaces the 20-day file-age rule. A Monday `keepalive` job restores the cache so GitHub's 7-day eviction never removes it between monthly runs (Test 28). |
+| I-35 | `build`/`tests` never run for a schedule that is switched off (the build job's `!cancelled()` alone would have started an all-India build with no extraction). |

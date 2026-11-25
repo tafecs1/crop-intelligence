@@ -348,3 +348,53 @@ def test_27_resume_workflow_wiring():
     assert 'gh workflow run cropintel.yml' in cmd and 'run_date="${{ needs.setup.outputs.run_date }}"' in cmd
     setup = wf['jobs']['setup']['steps'][0]['run']
     assert 'github.event.inputs.run_date' in setup
+
+
+def test_28_monthly_cache_reuse_and_pruning():
+    """v4.6: half-year groups are calendar-aligned (finished half-years keep their cache key next month); pruning keeps
+    same-day files and in-window half-years, drops other run dates, out-of-window months and other runs' resume flags."""
+    import pathlib, re, datetime as dt, tempfile, os as _os, itertools
+    src = pathlib.Path(__file__).resolve().parents[1].joinpath('crop_intel.py').read_text()
+    g = src[src.index('_mgroups = '):].split('\n', 1)[0]
+    def add_months(d, k):
+        y, m = divmod(d.month - 1 + k, 12); return dt.date(d.year + y, m + 1, 1)
+    keys = []
+    for cur in (dt.date(2026, 11, 1), dt.date(2026, 12, 1)):
+        ns = dict(MONTHS=[add_months(cur, -i) for i in range(23, -1, -1)], __import__=__import__)
+        exec(g, ns); keys.append({f'{a[0]:%Y%m}_{a[-1]:%Y%m}' for a in ns['_mgroups']})
+    assert {'202501_202506', '202507_202512', '202601_202606'} <= keys[0] & keys[1]
+    body = src[src.index('def prune_cache():'):src.index('prune_cache()\n', src.index('def prune_cache():'))]
+    d = tempfile.mkdtemp()
+    names = {'M_202501_202506_aaaaaaaaaaaa.json': True, 'M_202412_202412_bbbbbbbbbbbb.json': True,
+             'M_202301_202306_cccccccccccc.json': False, 'M_202607_202611_2026-11-25_dddddddddddd.json': True,
+             'TREND6_2026-11-25_ab12cd34_eeeeeeeeeeee.json': True, 'TREND6_2026-11-18_ab12cd34_ffffffffffff.json': False,
+             'WX_2026-10-02_000000000000.json': False, '_budget_hit_99_0.flag': False, '_budget_hit_42_1.flag': True}
+    for n in names:
+        open(_os.path.join(d, n), 'w').write('[]')
+    ns = dict(os=_os, re=re, CACHE_DIR=d, TODAY=dt.date(2026, 11, 25), RUN_TAG='42', MONTHS_BACK=24,
+              MONTHS=[add_months(dt.date(2026, 11, 1), -i) for i in range(23, -1, -1)])
+    exec(body, ns); ns['prune_cache']()
+    left = set(_os.listdir(d))
+    assert left == {n for n, keep in names.items() if keep}, left ^ {n for n, keep in names.items() if keep}
+
+
+def test_29_shard_handoff_before_exit_and_schedule_guards():
+    """v4.6: the time-budget flag is written BEFORE the extract-only exit (v4.5 bug), shards upload only used files, and the
+    schedule option (monthly default = all India, weekly/both via CROPINTEL_SCHEDULE) gates every job that does work."""
+    import pathlib, yaml
+    root = pathlib.Path(__file__).resolve().parents[1]
+    src = root.joinpath('crop_intel.py').read_text()
+    assert src.index('_budget_hit_{RUN_TAG}_') < src.index("print(f'Extraction-only shard finished")
+    assert 'shutil.copy2(p_, _out)' in src and 'CACHE_USED.add(p)' in src
+    wf = yaml.safe_load(root.joinpath('.github/workflows/cropintel.yml').read_text())
+    crons = [c['cron'] for c in wf[True]['schedule']]
+    assert crons == ['30 20 1 * *', '30 20 * * 0']
+    j = wf['jobs']
+    for k in ('setup', 'tests'):
+        assert "vars.CROPINTEL_SCHEDULE != 'weekly'" in j[k]['if'] and "vars.CROPINTEL_SCHEDULE == 'both'" in j[k]['if']
+    assert "needs.setup.result == 'success'" in j['build']['if']
+    assert "github.event.schedule == '30 20 1 * *' && 'ALL'" in wf['env']['STATE_FILTER']
+    up = [s for s in j['extract']['steps'] if s.get('uses', '').startswith('actions/upload-artifact')][0]
+    assert up['with']['path'] == 'work/shard_out'
+    assert any(s.get('uses', '').startswith('actions/cache/save') for s in j['build']['steps'])
+    assert j['keepalive']['if'] == "${{ github.event.schedule == '30 20 * * 0' }}"

@@ -28,7 +28,7 @@ BHARATLAS         = "https://bharatlas.com/api/v1"
 TEHSIL_SOURCE_URL = "https://bharatlas.com/api/dl/admin/subdistricts/LGD_Subdistricts.parquet"
 SIMPLIFY_DEG      = 0.002                   # boundary simplification (~200 m) so polygons can be sent to Earth Engine
 BOUNDARY_UNIT = 'Tehsil / Sub-district (LGD)'
-STATE_FILTER  = [x.strip() for x in os.environ.get('STATE_FILTER', '').split(',') if x.strip()]   # empty = ALL INDIA; e.g. 'Tamil Nadu,Kerala'
+STATE_FILTER  = [x.strip() for x in os.environ.get('STATE_FILTER', '').split(',') if x.strip() and x.strip().upper() != 'ALL']   # empty or ALL = ALL INDIA; e.g. 'Tamil Nadu,Kerala'
 
 WORK_DIR     = os.path.abspath(os.environ.get('CROP_WORK_DIR', 'work'))   # run folder (cache, downloads, Excel)
 INPUT_DIR    = os.path.abspath(os.environ.get('CROP_INPUT_DIR', 'data'))  # optional input files committed to the repo
@@ -82,7 +82,7 @@ REFERENCE_AREAS = [
          date='2026-11-14', source='newkerala.com, 14-Nov-2026 – also reports crops "planted about a month ago"'),
 ]
 FIELD_OBS_CSV    = f'{INPUT_DIR}/field_observations.csv'  # OPTIONAL ground truth: tehsil_lgd,crop,stage,observation_date,planting_date
-MODEL_VERSION   = 'CropIntel-v4.5'
+MODEL_VERSION   = 'CropIntel-v4.6'
 MIN_EXTRACT_COVERAGE = 0.95                 # v4.2: stop before writing if crop maps / trends are missing for > 5 % of cropland tehsils
 RUN_DATE        = os.environ.get('RUN_DATE') or None   # set once per workflow run so all jobs share the same date
 
@@ -1017,11 +1017,31 @@ def _budget_flags():
     except FileNotFoundError:
         return []
 SHARD_FLAGGED = bool(_budget_flags())
+CACHE_USED = set()                                    # v4.6: cache files this run used – the only files a shard hands to the build job
+
+# v4.6 name-based cache pruning (replaces the 20-day file-age rule, which would wipe last month's work before a monthly run):
+#   • files tagged with a run date (TREND6_/CUR5_/OBS1_/MAPS5_/WX_/current-month M_ …_YYYY-MM-DD) are kept only for that date
+#     (same-day resumes reuse them); • finished half-year composites (M_YYYYMM_YYYYMM, no date) are kept while inside the
+#     MONTHS_BACK window; • old resume flags of other workflow runs are removed.
+def prune_cache():
+    n_ = 0
+    for f_ in os.listdir(CACHE_DIR) if os.path.isdir(CACHE_DIR) else []:
+        d_ = re.search(r'_(\d{4}-\d{2}-\d{2})(?:_|\.json$)', f_)
+        m_ = re.match(r'M_(\d{6})_(\d{6})(?:_\d{4}-\d{2}-\d{2})?_[0-9a-f]{12}\.json$', f_)
+        old = ((d_ and d_.group(1) != str(TODAY)) or
+               (m_ and m_.group(2) < f'{MONTHS[0]:%Y%m}') or
+               (f_.startswith('_budget_hit_') and not f_.startswith(f'_budget_hit_{RUN_TAG}_')))
+        if old:
+            os.remove(os.path.join(CACHE_DIR, f_)); n_ += 1
+    if n_:
+        print(f'🧹 Cache: removed {n_} files from other run dates / outside the {MONTHS_BACK}-month window')
+prune_cache()
 
 def safe_reduce(kind, codes, img_fn, add_area=False, scale=None, reducer=None):
     global BUDGET_HIT
     p = _cache_path(kind, codes)
     if os.path.exists(p):
+        CACHE_USED.add(p)
         return json.load(open(p))
     if SHARD_FLAGGED or (EXTRACT_BUDGET_MIN and (time.time() - _T_START) / 60 > EXTRACT_BUDGET_MIN):
         if not BUDGET_HIT:
@@ -1049,6 +1069,7 @@ def safe_reduce(kind, codes, img_fn, add_area=False, scale=None, reducer=None):
     res = run(list(codes))
     if len(res) >= len(codes):
         json.dump(res, open(p, 'w'))
+        CACHE_USED.add(p)
     return res
 
 SAT_MONTHLY, SAT_TREND, SAT_CUR, SAT_MAPS, SAT_WX = {}, {}, {}, {}, {}
@@ -1072,7 +1093,9 @@ if SHARD_COUNT > 1:
     _batches = [_batches[i] for i in sorted(_mine)]
     _st = sorted({s_ for s_ in _by_state.index for b_ in _batches if b_[0] in set(_by_state[s_])})
     print(f'Shard {SHARD_INDEX + 1}/{SHARD_COUNT}: {len(_batches)} batches, {sum(map(len, _batches))} tehsils → {_st}')
-_mgroups = [MONTHS[i:i + 6] for i in range(0, len(MONTHS), 6)]
+# v4.6: calendar half-years (Jan-Jun, Jul-Dec). The old rolling 6-month groups shifted every month, so no monthly composite was
+#       ever reused by the next month's run; with fixed half-years every finished half-year keeps its cache key.
+_mgroups = [list(g_) for _, g_ in __import__('itertools').groupby(MONTHS, key=lambda m_: (m_.year, (m_.month - 1) // 6))]
 _t0 = time.time()
 for bi, codes in enumerate(_batches, 1):
     for mg in _mgroups:
@@ -1092,11 +1115,18 @@ for bi, codes in enumerate(_batches, 1):
     el = time.time() - _t0
     print(f'Batch {bi}/{len(_batches)} | {el / 60:.1f} min | ETA {el / bi * (len(_batches) - bi) / 60:.1f} min')
 print(f'✅ Extraction done: monthly {len(SAT_MONTHLY)} · trend {len(SAT_TREND)} · current {len(SAT_CUR)} · maps {len(SAT_MAPS)} · weather {len(SAT_WX)}')
-if EXTRACT_ONLY:
-    print('Extraction-only shard finished – cache saved in', CACHE_DIR)
-    sys.exit(0)
 if BUDGET_HIT and not SHARD_FLAGGED:                  # v4.5: tell the build job (via the cache artifact) that this shard stopped early
-    open(f"{CACHE_DIR}/_budget_hit_{RUN_TAG}_{os.environ.get('SHARD_INDEX', 'x')}.flag", 'w').write(str(TODAY))
+    _fl = f"{CACHE_DIR}/_budget_hit_{RUN_TAG}_{os.environ.get('SHARD_INDEX', 'x')}.flag"
+    open(_fl, 'w').write(str(TODAY)); CACHE_USED.add(_fl)
+# ---- end of extraction hand-off ----
+if EXTRACT_ONLY:                                      # v4.6: hand only the files this shard used to the build job
+    import shutil
+    _out = f'{WORK_DIR}/shard_out'
+    os.makedirs(_out, exist_ok=True)
+    for p_ in CACHE_USED:
+        shutil.copy2(p_, _out)
+    print(f'Extraction-only shard finished – {len(CACHE_USED)} cache files handed to the build job')
+    sys.exit(0)
 
 # v4.2 extraction completeness gate: a tehsil whose crop-map / trend reduction failed must NEVER be published as "fallow"
 # (RUN-20261124-130006 published all 291 Tamil Nadu tehsils as fallow because every TREND/MAPS batch had failed).
