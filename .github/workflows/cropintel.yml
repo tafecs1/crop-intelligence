@@ -17,13 +17,24 @@ on:
         description: 'Rice threshold calibration table (true/false) – use with a single state'
         required: false
         default: 'false'
+      run_date:
+        description: 'Leave empty (set automatically when a run resumes itself)'
+        required: false
+        default: ''
+      resume_attempt:
+        description: 'Leave 0 (counts automatic resumes)'
+        required: false
+        default: '0'
 
 concurrency:
   group: cropintel
   cancel-in-progress: false
 
 env:
-  STATE_FILTER: ${{ github.event.inputs.state_filter || '' }}
+  # v4.4: scheduled runs use the repo variable CROPINTEL_STATES (Settings → Secrets and variables → Actions → Variables),
+  #       e.g. "Tamil Nadu"; empty = ALL INDIA. A manual run's States box overrides it.
+  STATE_FILTER: ${{ github.event.inputs.state_filter || vars.CROPINTEL_STATES || '' }}
+  EXTRACT_BUDGET_MIN: '270'        # v4.4: start no new Earth Engine work after 4 h 30 min (job timeout 350 min; one restricted-mode batch can take ~1 h)
   RICE_CALIBRATE: ${{ github.event.inputs.rice_calibrate || 'false' }}
   # chosen rice thresholds: Settings → Secrets and variables → Actions → Variables (empty = defaults in crop_intel.py)
   RICE_VH_FLOOD_DB: ${{ vars.RICE_VH_FLOOD_DB }}
@@ -42,8 +53,9 @@ jobs:
     steps:
       - id: p
         run: |
-          N="${{ github.event.inputs.shards || '6' }}"
-          echo "run_date=$(TZ=Asia/Kolkata date +%F)" >> "$GITHUB_OUTPUT"
+          N="${{ github.event.inputs.shards || vars.CROPINTEL_SHARDS || '6' }}"
+          D="${{ github.event.inputs.run_date }}"
+          echo "run_date=${D:-$(TZ=Asia/Kolkata date +%F)}" >> "$GITHUB_OUTPUT"
           echo "count=$N" >> "$GITHUB_OUTPUT"
           echo "shards=$(python3 -c "import json;print(json.dumps(list(range($N))))")" >> "$GITHUB_OUTPUT"
 
@@ -100,6 +112,8 @@ jobs:
     if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     timeout-minutes: 350
+    outputs:
+      resume: ${{ steps.chk.outputs.resume }}
     env:
       RUN_DATE: ${{ needs.setup.outputs.run_date }}
       EE_KEY_JSON: ${{ secrets.EE_KEY_JSON }}
@@ -129,6 +143,10 @@ jobs:
           path: work/cropgrids
           key: cropgrids-v1.07-india
       - run: python crop_intel.py
+      - id: chk                    # v4.5: crop_intel.py writes work/RESUME_NEEDED when extraction stopped on the time budget
+        if: always()
+        run: |
+          if [ -f work/RESUME_NEEDED ]; then echo "resume=true" >> "$GITHUB_OUTPUT"; else echo "resume=false" >> "$GITHUB_OUTPUT"; fi
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -139,3 +157,20 @@ jobs:
             work/crop_phenology_db.csv
             work/validation_report.xlsx
           retention-days: 30
+
+  resume:                            # v4.5: automatic same-date re-run when the time budget stopped extraction (max 3 resumes)
+    needs: [setup, build]
+    if: ${{ always() && needs.build.outputs.resume == 'true' && fromJSON(github.event.inputs.resume_attempt || '0') < 3 }}
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - run: |
+          N=$(( ${{ github.event.inputs.resume_attempt || '0' }} + 1 ))
+          echo "Resume $N/3 for run date ${{ needs.setup.outputs.run_date }} (cached batches are reused)"
+          gh workflow run cropintel.yml --repo "${{ github.repository }}" --ref "${{ github.ref_name }}" \
+            -f state_filter="${{ env.STATE_FILTER }}" -f shards="${{ needs.setup.outputs.count }}" \
+            -f rice_calibrate="${{ env.RICE_CALIBRATE }}" -f run_date="${{ needs.setup.outputs.run_date }}" \
+            -f resume_attempt="$N"
