@@ -60,7 +60,7 @@ jobs:
     steps:
       - id: p
         run: |
-          N="${{ github.event.schedule == '30 20 1 * *' && (vars.CROPINTEL_MONTHLY_SHARDS || '20') || (github.event.inputs.shards || vars.CROPINTEL_SHARDS || '6') }}"
+          N="${{ github.event.schedule == '30 20 1 * *' && (vars.CROPINTEL_MONTHLY_SHARDS || '10') || (github.event.inputs.shards || vars.CROPINTEL_SHARDS || '6') }}"
           D="${{ github.event.inputs.run_date }}"
           echo "run_date=${D:-$(TZ=Asia/Kolkata date +%F)}" >> "$GITHUB_OUTPUT"
           echo "count=$N" >> "$GITHUB_OUTPUT"
@@ -121,6 +121,7 @@ jobs:
     outputs:
       resume: ${{ steps.chk.outputs.resume }}
     env:
+      SHARD_TOTAL: ${{ needs.setup.outputs.count }}     # v4.7: crashed shards → automatic resume
       RUN_DATE: ${{ needs.setup.outputs.run_date }}
       EE_KEY_JSON: ${{ secrets.EE_KEY_JSON }}
       EE_PROJECT: ${{ secrets.EE_PROJECT }}
